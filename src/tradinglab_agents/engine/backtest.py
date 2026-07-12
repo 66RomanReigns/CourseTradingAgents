@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from typing import Sequence
 
 from tradinglab_agents.agents.context import ContextAnalystAgent
 from tradinglab_agents.agents.critic import CriticAgent
@@ -9,6 +10,7 @@ from tradinglab_agents.agents.regime import RegimeAssessment, RegimeGuardAgent
 from tradinglab_agents.broker.paper import PaperBroker
 from tradinglab_agents.config import BacktestSettings
 from tradinglab_agents.data.csv_provider import LocalCsvProvider
+from tradinglab_agents.data.evidence_provider import LocalPointInTimeEvidenceProvider
 from tradinglab_agents.data.news_provider import LocalNewsProvider
 from tradinglab_agents.engine.features import FeatureEngine
 from tradinglab_agents.engine.fusion import DecisionFusion
@@ -28,7 +30,9 @@ class BacktestEngine:
         provider: LocalCsvProvider,
         news_provider: LocalNewsProvider | None = None,
         variant_name: str = "full_agent",
+        evidence_providers: Sequence[LocalPointInTimeEvidenceProvider] | None = None,
     ) -> dict:
+        evidence_providers = tuple(evidence_providers or ())
         bars = list(provider.bars)
         warmup = max(20, self.settings.warmup_bars)
         if len(bars) <= warmup + 1:
@@ -73,11 +77,17 @@ class BacktestEngine:
             pack = feature_engine.build(visible, decision_bar.available_at)
             if self.settings.enable_context and news_provider is not None:
                 news_provider.add_to_pack(pack)
+            if self.settings.enable_context:
+                for external_provider in evidence_providers:
+                    external_provider.add_to_pack(pack)
 
             quant_opinion = quant.analyze(pack)
+            has_context_evidence = any(
+                item.kind in {"news", "macro", "fundamental"} for item in pack.evidence
+            )
             context_opinion = (
                 context.analyze(pack)
-                if self.settings.enable_context and news_provider is not None
+                if self.settings.enable_context and has_context_evidence
                 else None
             )
             combined = fusion.combine(quant_opinion, context_opinion)

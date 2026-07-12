@@ -11,7 +11,7 @@ class ApiTest(unittest.TestCase):
         result = health()
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["mode"], "paper-trading-only")
-        self.assertEqual(result["version"], "0.3.0")
+        self.assertEqual(result["version"], "0.4.0")
 
     def test_backtest_endpoint_function(self):
         result = backtest(RunRequest())

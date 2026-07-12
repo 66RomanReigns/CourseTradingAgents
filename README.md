@@ -2,7 +2,7 @@
 
 一个面向课程作业的、可复现且可审计的多智能体模拟交易系统。
 
-当前版本：**v0.3.0**。
+当前版本：**v0.4.0**。
 
 本项目参考 TauricResearch/TradingAgents 的“多角色协作分析”思想，但没有复制其十余个 LLM 角色、复杂 LangGraph 拓扑和多种在线数据接口。项目重新设计为一个更适合课程验收的混合系统：语言模型风格模块只处理非结构化上下文，行情计算、仓位控制、成交模拟与审计全部由确定性程序完成。
 
@@ -11,10 +11,14 @@
 ## 1. 核心设计
 
 ```text
-本地 OHLCV + 时间戳新闻
+Twelve Data 行情 + Alpha Vantage 新闻
+FRED 宏观 + SEC EDGAR 基本面
             │
             ▼
-Data Provider + Feature Engine
+点时缓存与统一 Data Provider
+            │
+            ▼
+Feature Engine
             │
             ▼
       EvidencePack
@@ -40,7 +44,7 @@ Quant Agent   Context Agent
 ### 智能体职责
 
 - **Quant Signal Agent**：计算动量、趋势、波动率和成交量因子，输出可解释量化意见。
-- **Context Agent**：通过可替换的结构化推理接口分析点时新闻。默认使用确定性 `MockLLM`，无 API 也能复现。
+- **Context Agent**：通过可替换的结构化推理接口分析点时新闻、宏观和基本面证据。默认使用确定性 `MockLLM`，无 LLM API 也能复现。
 - **Critic Agent**：检查证据引用、信号冲突和高波动风险，将不可靠意见降级为 HOLD。
 - **Regime Guard Agent**：根据仅使用历史数据识别牛市、熊市、震荡、高波动或过渡状态，只限制风险暴露，不主动制造买入信号。
 - **Risk Governor**：执行仓位上限、最低置信度和最大回撤等硬约束。
@@ -51,7 +55,7 @@ Quant Agent   Context Agent
 |---|---|---|
 | 智能体数量 | 十余个分析、辩论、风险角色 | 4 个职责明确的分析/约束模块 |
 | LLM 依赖 | 主流程强依赖外部模型 | 默认离线 MockLLM，可替换但不强依赖 |
-| 数据源 | 多个在线行情、新闻、社区和宏观接口 | 本地 CSV/JSONL 优先，接口可替换 |
+| 数据源 | 多个在线行情、新闻、社区和宏观接口 | Twelve Data、Alpha Vantage、FRED、SEC EDGAR，经统一缓存后转为本地点时数据 |
 | 风控 | 多角色语言讨论 | 确定性硬约束 |
 | 执行 | 侧重投资结论 | 完整目标仓位、手续费、滑点和持仓账本 |
 | 复现 | 受 API、模型和网络影响 | 固定数据、配置、哈希、运行清单和 SQLite |
@@ -190,17 +194,35 @@ curl --noproxy '*' -X POST http://127.0.0.1:8000/experiments \
 
 这些结果只说明系统逻辑与风险权衡在确定性场景中可验证，不证明真实市场盈利能力。详细结果见 `docs/05_EXPERIMENT_REPORT.md`。
 
-## 8. 真实数据导入
+## 8. 免费真实数据 API
 
-将 Yahoo Finance 风格 CSV 转为项目格式：
+项目已经原生接入：
+
+- Twelve Data：日线 OHLCV；
+- Alpha Vantage：新闻与 ticker 情绪；
+- FRED：带首次 vintage 日期的宏观数据；
+- SEC EDGAR：按 filing date 可见的 Company Facts 基本面。
+
+下载示例：
 
 ```bash
-python3 scripts/normalize_ohlcv_csv.py \
-  --input your_yahoo_data.csv \
-  --output data/sample/real_data.csv
+export TWELVE_DATA_API_KEY="..."
+PYTHONPATH=src python3 -m tradinglab_agents.cli fetch-market \
+  --symbol SPY --start 2018-01-01 --output data/real/SPY.csv
 ```
 
-随后替换 `--csv` 参数即可运行同一套回测和审计流程。
+真实证据回测：
+
+```bash
+PYTHONPATH=src python3 -m tradinglab_agents.cli experiment \
+  --csv data/real/SPY.csv \
+  --news data/real/SPY_news.jsonl \
+  --evidence data/real/macro.jsonl \
+  --evidence data/real/SPY_fundamentals.jsonl \
+  --symbol SPY --config config/default.yaml
+```
+
+完整说明见 `docs/09_FREE_DATA_APIS.md`。原有 Yahoo Finance 风格 CSV 转换脚本仍保留在 `scripts/normalize_ohlcv_csv.py`。
 
 ## 9. 项目结构
 

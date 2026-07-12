@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.4.0 — free real-data integrations
+
+- Added a dependency-free HTTPS JSON client with caching, retries, response-size limits and API-key redaction.
+- Added Twelve Data daily OHLCV integration and export to the project CSV schema.
+- Added Alpha Vantage news/sentiment integration and point-in-time JSONL export.
+- Added FRED vintage-aware macro observations using earliest realtime availability.
+- Added SEC EDGAR ticker resolution and Company Facts extraction using filing dates.
+- Added generic macro/fundamental evidence providers to the backtest and FastAPI request model.
+- Added CLI fetch commands and environment-variable configuration.
+- Expanded the test suite to 27 unit/integration checks with mocked official API responses.
+
 ## v0.3.0 — course-ready research build
 
 - Added Regime Guard Agent with trailing-only classification and hysteresis.

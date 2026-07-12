@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from tradinglab_agents import __version__
 from tradinglab_agents.config import BacktestSettings, load_settings
 from tradinglab_agents.data.csv_provider import LocalCsvProvider
+from tradinglab_agents.data.evidence_provider import LocalPointInTimeEvidenceProvider
 from tradinglab_agents.data.news_provider import LocalNewsProvider
 from tradinglab_agents.engine.backtest import BacktestEngine
 from tradinglab_agents.evaluation.experiments import run_experiment_suite, save_run_bundle
@@ -28,6 +29,7 @@ app = FastAPI(
 class RunRequest(BaseModel):
     csv_path: str = "data/sample/demo.csv"
     news_path: str | None = "data/sample/demo_news.jsonl"
+    evidence_paths: list[str] = Field(default_factory=list)
     symbol: str = Field(default="DEMO", min_length=1, max_length=32)
     config_path: str | None = "config/default.yaml"
     initial_cash: float | None = Field(default=None, gt=0)
@@ -56,17 +58,19 @@ def _components(request: RunRequest):
     csv_path = _safe_path(request.csv_path)
     news_path = _safe_path(request.news_path, required=False)
     config_path = _safe_path(request.config_path, required=False)
+    evidence_paths = [_safe_path(value) for value in request.evidence_paths]
     settings = load_settings(config_path) if config_path else BacktestSettings()
     if request.initial_cash is not None:
         settings = replace(settings, initial_cash=request.initial_cash)
     prices = LocalCsvProvider(csv_path, request.symbol)
     news = LocalNewsProvider(news_path) if news_path else None
-    inputs = [csv_path]
+    evidence = [LocalPointInTimeEvidenceProvider(path) for path in evidence_paths]
+    inputs = [csv_path, *evidence_paths]
     if news_path:
         inputs.append(news_path)
     if config_path:
         inputs.append(config_path)
-    return prices, news, settings, inputs
+    return prices, news, evidence, settings, inputs
 
 
 @app.get("/")
@@ -94,8 +98,10 @@ def health() -> dict:
 @app.post("/backtest")
 def backtest(request: RunRequest) -> dict:
     try:
-        prices, news, settings, _ = _components(request)
-        result = BacktestEngine(settings).run(prices, news)
+        prices, news, evidence, settings, _ = _components(request)
+        result = BacktestEngine(settings).run(
+            prices, news, evidence_providers=evidence
+        )
         return {
             "name": result["name"],
             "symbol": result["symbol"],
@@ -113,8 +119,8 @@ def backtest(request: RunRequest) -> dict:
 @app.post("/experiments")
 def experiments(request: RunRequest) -> dict:
     try:
-        prices, news, settings, input_files = _components(request)
-        result = run_experiment_suite(prices, settings, news)
+        prices, news, evidence, settings, input_files = _components(request)
+        result = run_experiment_suite(prices, settings, news, evidence)
         response = {
             "symbol": result["symbol"],
             "summary": result["summary"],

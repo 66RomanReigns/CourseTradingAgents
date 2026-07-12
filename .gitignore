@@ -19,6 +19,7 @@ artifacts/*
 !artifacts/.gitkeep
 data/raw/
 data/cache/
+data/real/
 *.db
 *.sqlite
 *.sqlite3

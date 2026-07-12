@@ -4,9 +4,11 @@ import json
 import shutil
 from dataclasses import replace
 from pathlib import Path
+from typing import Sequence
 
 from tradinglab_agents.config import BacktestSettings
 from tradinglab_agents.data.csv_provider import LocalCsvProvider
+from tradinglab_agents.data.evidence_provider import LocalPointInTimeEvidenceProvider
 from tradinglab_agents.data.news_provider import LocalNewsProvider
 from tradinglab_agents.engine.backtest import BacktestEngine
 from tradinglab_agents.evaluation.audit import audit_experiment
@@ -31,9 +33,13 @@ def run_experiment_suite(
     provider: LocalCsvProvider,
     settings: BacktestSettings,
     news_provider: LocalNewsProvider | None = None,
+    evidence_providers: Sequence[LocalPointInTimeEvidenceProvider] | None = None,
 ) -> dict:
+    evidence_providers = tuple(evidence_providers or ())
     variants = [
-        BacktestEngine(settings).run(provider, news_provider, "full_agent"),
+        BacktestEngine(settings).run(
+            provider, news_provider, "full_agent", evidence_providers
+        ),
         BacktestEngine(replace(settings, enable_context=False)).run(
             provider, None, "quant_plus_critic"
         ),
@@ -41,10 +47,10 @@ def run_experiment_suite(
             provider, None, "quant_only"
         ),
         BacktestEngine(replace(settings, enable_risk=False)).run(
-            provider, news_provider, "without_risk_governor"
+            provider, news_provider, "without_risk_governor", evidence_providers
         ),
         BacktestEngine(replace(settings, enable_regime_guard=False)).run(
-            provider, news_provider, "without_regime_guard"
+            provider, news_provider, "without_regime_guard", evidence_providers
         ),
         run_sma_cross(
             provider,

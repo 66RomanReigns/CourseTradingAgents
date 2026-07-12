@@ -9,9 +9,14 @@ class ContextAnalystAgent:
         self.reasoner = reasoner or MockLLM()
 
     def analyze(self, pack: EvidencePack) -> AgentOpinion:
+        supported_kinds = {"news", "macro", "fundamental"}
         items = [
-            {"evidence_id": item.evidence_id, "text": str(item.value)}
-            for item in pack.by_kind("news")
+            {
+                "evidence_id": item.evidence_id,
+                "text": f"kind={item.kind}; detail={item.detail}; value={item.value}",
+            }
+            for item in pack.evidence
+            if item.kind in supported_kinds
         ]
         result = self.reasoner.analyze_news(items)
         score = float(result.get("score", 0.0))
