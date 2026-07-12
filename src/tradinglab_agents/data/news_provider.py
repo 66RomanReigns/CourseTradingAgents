@@ -26,6 +26,10 @@ class LocalNewsProvider:
         self.path = Path(path)
         self._events = self._load()
 
+    @property
+    def events(self) -> tuple[NewsEvent, ...]:
+        return tuple(self._events)
+
     def _load(self) -> list[NewsEvent]:
         events: list[NewsEvent] = []
         if not self.path.exists():

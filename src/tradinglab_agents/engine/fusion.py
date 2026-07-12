@@ -4,12 +4,26 @@ from tradinglab_agents.models import Action, AgentOpinion, TradeIntent
 
 
 class DecisionFusion:
-    def __init__(self, quant_weight: float = 0.75, context_weight: float = 0.25):
+    def __init__(
+        self,
+        quant_weight: float = 0.75,
+        context_weight: float = 0.25,
+        buy_threshold: float = 0.035,
+        sell_threshold: float = -0.035,
+        conflict_penalty: float = 0.70,
+    ):
         total = quant_weight + context_weight
         if total <= 0:
             raise ValueError("fusion weights must sum to a positive value")
+        if buy_threshold <= 0 or sell_threshold >= 0:
+            raise ValueError("buy threshold must be positive and sell threshold negative")
+        if not 0.0 <= conflict_penalty <= 1.0:
+            raise ValueError("conflict_penalty must be in [0, 1]")
         self.quant_weight = quant_weight / total
         self.context_weight = context_weight / total
+        self.buy_threshold = buy_threshold
+        self.sell_threshold = sell_threshold
+        self.conflict_penalty = conflict_penalty
 
     @staticmethod
     def _signed(opinion: AgentOpinion) -> float:
@@ -36,15 +50,15 @@ class DecisionFusion:
             disagreement = quant_signal * context_signal < 0
             confidence = self.quant_weight * quant.confidence + self.context_weight * context.confidence
             if disagreement:
-                confidence *= 0.70
+                confidence *= self.conflict_penalty
             evidence_ids = tuple(dict.fromkeys((*quant.evidence_ids, *context.evidence_ids)))
             rationale = (
                 f"quant={quant_signal:.4f}; context={context_signal:.4f}; "
-                f"disagreement={disagreement}"
+                f"disagreement={disagreement}; conflict_penalty={self.conflict_penalty:.2f}"
             )
-        if combined > 0.035:
+        if combined > self.buy_threshold:
             action = Action.BUY
-        elif combined < -0.035:
+        elif combined < self.sell_threshold:
             action = Action.SELL
         else:
             action = Action.HOLD

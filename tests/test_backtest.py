@@ -46,6 +46,7 @@ class BacktestTest(unittest.TestCase):
                 "quant_plus_critic",
                 "quant_only",
                 "without_risk_governor",
+                "without_regime_guard",
                 "sma_cross",
                 "buy_and_hold",
             },

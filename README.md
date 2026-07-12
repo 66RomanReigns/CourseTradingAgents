@@ -1,190 +1,245 @@
-# CourseTradingAgents / TradeLab-Agent
+# TradeLab-Agent
 
-一个面向课程作业的、可复现的多智能体交易研究与模拟盘系统。
+一个面向课程作业的、可复现且可审计的多智能体模拟交易系统。
 
-> 当前版本：`0.2.0`。离线数据、证据包、三个智能体、确定性风控、模拟成交、回测、基线、消融实验、CLI 与 FastAPI 均已实现。
+当前版本：**v0.3.0**。
 
-## 项目定位
+本项目参考 TauricResearch/TradingAgents 的“多角色协作分析”思想，但没有复制其十余个 LLM 角色、复杂 LangGraph 拓扑和多种在线数据接口。项目重新设计为一个更适合课程验收的混合系统：语言模型风格模块只处理非结构化上下文，行情计算、仓位控制、成交模拟与审计全部由确定性程序完成。
 
-本项目参考 TauricResearch/TradingAgents 的“多角色协作分析”思想，但没有复制其十余个角色、多轮辩论和大量外部数据接口。项目重点是：
+> 本项目只用于课程研究、软件工程演示和模拟盘实验，不构成投资建议，也不连接真实资金账户。
 
-1. **少而有效的智能体**：Quant、Context、Critic 三个职责明确的模块。
-2. **LLM 与量化规则分工**：上下文模块可替换模型；数值计算、风控和成交保持确定性。
-3. **离线可运行**：默认使用本地 CSV、JSONL 新闻和 MockLLM。
-4. **严格时间边界**：证据必须满足 `available_at <= decision_time`，收盘决策、下一交易日开盘成交。
-5. **可复现实验**：固定随机种子、数据快照、配置、交易成本和模块消融。
-6. **模拟盘闭环**：信号经过目标仓位、风险审查、滑点、手续费、现金与持仓更新。
-
-项目只用于教学研究和模拟盘，不连接真实资金账户，也不构成投资建议。
-
-## 系统流水线
+## 1. 核心设计
 
 ```text
-本地 OHLCV / 时间安全新闻
-             ↓
+本地 OHLCV + 时间戳新闻
+            │
+            ▼
 Data Provider + Feature Engine
-             ↓
-EvidencePack（来源、时间、Evidence ID）
-             ↓
-Quant Agent ─────────┐
-                     ├→ Decision Fusion → Critic Agent
-Context Agent/MockLLM┘                         ↓
-                                         Risk Governor
-                                               ↓
-                                          Paper Broker
-                                               ↓
-                              Portfolio / Metrics / Trace / Report
+            │
+            ▼
+      EvidencePack
+            │
+     ┌──────┴──────┐
+     ▼             ▼
+Quant Agent   Context Agent
+     └──────┬──────┘
+            ▼
+      Decision Fusion
+            ▼
+       Critic Agent
+            ▼
+    Regime Guard Agent
+            ▼
+      Risk Governor
+            ▼
+       Paper Broker
+            ▼
+回测、审计、SQLite、HTML 报告
 ```
 
-## 主要原创改进
+### 智能体职责
 
-- 用 `EvidencePack` 强制每个结论绑定可审计证据，并拒绝未来证据和重复 ID。
-- 将多轮多空辩论压缩为一次 Critic 反证检查，降低成本并支持消融。
-- 风控不是语言角色投票，而是持续生效的仓位上限、置信度阈值和回撤熔断。
-- 仓位因价格上涨漂移超限时，即使上层信号为 HOLD，Risk Governor 也能强制减仓。
-- 引入最小调仓阈值和冷却周期，避免每天微调造成不必要换手。
-- 所有基线与智能体使用相同暖启动区间、手续费、滑点和执行时点。
+- **Quant Signal Agent**：计算动量、趋势、波动率和成交量因子，输出可解释量化意见。
+- **Context Agent**：通过可替换的结构化推理接口分析点时新闻。默认使用确定性 `MockLLM`，无 API 也能复现。
+- **Critic Agent**：检查证据引用、信号冲突和高波动风险，将不可靠意见降级为 HOLD。
+- **Regime Guard Agent**：根据仅使用历史数据识别牛市、熊市、震荡、高波动或过渡状态，只限制风险暴露，不主动制造买入信号。
+- **Risk Governor**：执行仓位上限、最低置信度和最大回撤等硬约束。
 
-## 快速运行
+## 2. 与参考项目的关键区别
 
-服务器项目目录：
+| 方面 | 参考项目 | TradeLab-Agent |
+|---|---|---|
+| 智能体数量 | 十余个分析、辩论、风险角色 | 4 个职责明确的分析/约束模块 |
+| LLM 依赖 | 主流程强依赖外部模型 | 默认离线 MockLLM，可替换但不强依赖 |
+| 数据源 | 多个在线行情、新闻、社区和宏观接口 | 本地 CSV/JSONL 优先，接口可替换 |
+| 风控 | 多角色语言讨论 | 确定性硬约束 |
+| 执行 | 侧重投资结论 | 完整目标仓位、手续费、滑点和持仓账本 |
+| 复现 | 受 API、模型和网络影响 | 固定数据、配置、哈希、运行清单和 SQLite |
+| 实验 | 主要比较最终收益 | 基线、模块消融、市场状态和四场景压力测试 |
+
+## 3. 快速开始
+
+进入项目：
 
 ```bash
 cd /home/amax/mcp-workspace/projects/trading-agent-course/CourseTradingAgents
 ```
 
-生成固定样例数据并运行全部测试：
+环境诊断：
+
+```bash
+make doctor
+```
+
+运行全部测试：
 
 ```bash
 make test
 ```
 
-运行完整智能体：
+运行单次回测：
 
 ```bash
 make backtest
 ```
 
-运行基线和消融实验：
+运行基线与消融实验：
 
 ```bash
 make experiment
 ```
 
-也可以直接使用 CLI：
+运行牛市、熊市、震荡和高波动压力测试：
+
+```bash
+make benchmark
+```
+
+查看已存档实验：
+
+```bash
+make runs
+```
+
+## 4. CLI
+
+安装后可使用 `tradinglab`；未安装时可通过 `PYTHONPATH=src python3 -m tradinglab_agents.cli` 执行。
 
 ```bash
 PYTHONPATH=src python3 -m tradinglab_agents.cli experiment \
   --csv data/sample/demo.csv \
   --news data/sample/demo_news.jsonl \
-  --config config/default.yaml \
-  --output artifacts/experiment.json \
-  --markdown artifacts/experiment.md
+  --config config/default.yaml
 ```
 
-## 当前实验结果
+每次正式实验会生成：
 
-固定合成数据包含上涨、下跌和恢复三种阶段。当前结果如下：
+```text
+artifacts/runs/<run_id>/
+├── experiment.json
+├── report.md
+├── report.html
+├── manifest.json
+└── audit.json
+```
 
-| 方案 | 总收益 | Sharpe | 最大回撤 | 成交数 |
-|---|---:|---:|---:|---:|
-| 完整智能体 | 5.91% | 2.619 | 1.23% | 8 |
-| Quant + Critic | 4.81% | 2.198 | 1.83% | 11 |
-| Quant only | 4.42% | 1.967 | 2.05% | 13 |
-| 移除风控 | 11.75% | 2.682 | 2.52% | 35 |
-| SMA Cross | 26.86% | 2.338 | 6.69% | 6 |
-| Buy and Hold | 26.05% | 1.856 | 13.23% | 1 |
+并将结果写入：
 
-这些结果不用于证明盈利能力。它们展示的是：完整智能体牺牲部分收益，显著降低了回撤和交易次数；简单趋势策略在该合成样例上收益更高，因此报告不会宣称智能体在所有数据上优于传统策略。
+```text
+artifacts/tradinglab.db
+```
 
-## API
+## 5. FastAPI 演示
 
-启动服务：
+启动：
 
 ```bash
 make api
 ```
 
-接口：
+常用接口：
 
-- `GET /health`
-- `POST /backtest`
-- `POST /experiments`
-- Swagger：`/docs`
+- `GET /health`：环境和服务状态；
+- `POST /backtest`：单次回测；
+- `POST /experiments`：基线和消融实验；
+- `GET /runs`：历史实验列表；
+- `GET /runs/{run_id}`：完整实验结果；
+- `GET /reports/latest`：最近一次 HTML 报告；
+- `GET /docs`：Swagger 文档。
 
-请求示例：
-
-```json
-{
-  "csv_path": "data/sample/demo.csv",
-  "news_path": "data/sample/demo_news.jsonl",
-  "symbol": "DEMO",
-  "config_path": "config/default.yaml"
-}
-```
-
-API 只允许读取项目根目录中的文件，阻止 `../` 路径逃逸。
-
-## Docker
+持久化实验示例：
 
 ```bash
-docker compose up --build
+curl --noproxy '*' -X POST http://127.0.0.1:8000/experiments \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "csv_path": "data/sample/demo.csv",
+    "news_path": "data/sample/demo_news.jsonl",
+    "symbol": "DEMO",
+    "config_path": "config/default.yaml",
+    "persist": true
+  }'
 ```
 
-服务默认监听 `8000` 端口。容器仅提供模拟回测 API，不包含真实券商接口。
+## 6. 时间安全与审计
 
-## 数据格式
+系统明确区分：
 
-行情 CSV：
+- `timestamp`：行情收盘时间；
+- `open_at`：下一根 K 线开盘时间；
+- `available_at`：数据实际可被策略看到的时间。
 
-```text
-timestamp,open_at,open,high,low,close,volume,available_at
+约束包括：
+
+1. 决策只能读取 `available_at <= decision_time` 的数据；
+2. 当日收盘形成信号，最早下一交易日开盘成交；
+3. 每条智能体意见必须引用当前 EvidencePack 中存在的 Evidence ID；
+4. 自动审计检查时间顺序、置信度、目标仓位和证据覆盖率；
+5. 输入文件、配置、Git 版本和 Python 环境写入 `manifest.json`。
+
+## 7. 当前实验结论
+
+在主合成数据上，完整智能体相较买入持有降低了收益，但显著降低了最大回撤。四场景压力测试中，完整智能体在熊市和高波动场景控制损失明显优于买入持有。
+
+加入 Regime Guard 后：
+
+- 四场景最差回撤从移除该模块时的约 **4.29%** 降至约 **2.60%**；
+- 震荡场景收益从约 **-3.03%** 改善到约 **-1.13%**；
+- 熊市场景仅损失约 **0.70%**，而买入持有约损失 **40.71%**；
+- 牛市场景因仓位受限，收益明显低于买入持有，体现了低风险暴露的代价。
+
+这些结果只说明系统逻辑与风险权衡在确定性场景中可验证，不证明真实市场盈利能力。详细结果见 `docs/05_EXPERIMENT_REPORT.md`。
+
+## 8. 真实数据导入
+
+将 Yahoo Finance 风格 CSV 转为项目格式：
+
+```bash
+python3 scripts/normalize_ohlcv_csv.py \
+  --input your_yahoo_data.csv \
+  --output data/sample/real_data.csv
 ```
 
-- `timestamp`：该根 K 线收盘时间；
-- `open_at`：该根 K 线开盘时间；
-- `available_at`：完整 K 线实际可被策略使用的时间，不能早于收盘。
+随后替换 `--csv` 参数即可运行同一套回测和审计流程。
 
-新闻 JSONL：
-
-```json
-{"event_id":"evt-001","symbol":"DEMO","published_at":"2025-01-02T12:00:00","available_at":"2025-01-02T12:01:00","headline":"...","summary":"...","source":"..."}
-```
-
-## 目录
+## 9. 项目结构
 
 ```text
 CourseTradingAgents/
-├── config/default.yaml
-├── data/sample/
-├── docs/
+├── config/                 # YAML 配置
+├── data/sample/            # 主示例数据
+├── data/scenarios/         # 四种确定性市场场景
+├── docs/                   # 设计、实验、部署和答辩材料
+├── scripts/                # 数据生成、转换和环境诊断
 ├── src/tradinglab_agents/
-│   ├── agents/
-│   ├── api/
-│   ├── broker/
-│   ├── data/
-│   ├── engine/
-│   ├── evaluation/
-│   └── risk/
+│   ├── agents/             # Quant / Context / Critic / Regime
+│   ├── api/                # FastAPI
+│   ├── broker/             # 模拟成交
+│   ├── data/               # 点时数据 Provider
+│   ├── engine/             # 特征、融合和回测编排
+│   ├── evaluation/         # 指标、基线、消融、审计和压力测试
+│   ├── reporting/          # Manifest 与 HTML 报告
+│   ├── risk/               # 确定性风控
+│   └── storage/            # SQLite 运行存档
 ├── tests/
-├── scripts/
-├── artifacts/
-├── Dockerfile
-├── docker-compose.yml
-└── Makefile
+├── Makefile
+└── pyproject.toml
 ```
 
-## 文档
+## 10. 文档索引
 
-- `docs/00_REFERENCE_ANALYSIS.md`：参考项目拆解和裁剪依据。
-- `docs/01_SYSTEM_DESIGN.md`：系统设计和原创改进。
-- `docs/02_IMPLEMENTATION_ROADMAP.md`：实施路线与验收标准。
-- `docs/03_SERVER_NOTES.md`：服务器环境和网络约束。
-- `docs/04_REFERENCE_CODE_REVIEW.md`：对用户上传源码的实际核对。
-- `docs/05_EXPERIMENT_REPORT.md`：基线与消融实验分析。
-- `docs/06_DEPLOYMENT.md`：CLI、API 和 Docker 部署说明。
+- `docs/00_REFERENCE_ANALYSIS.md`：参考项目拆解；
+- `docs/01_SYSTEM_DESIGN.md`：系统架构；
+- `docs/02_IMPLEMENTATION_ROADMAP.md`：实施路线；
+- `docs/03_SERVER_NOTES.md`：服务器环境与限制；
+- `docs/04_REFERENCE_CODE_REVIEW.md`：源码级核对；
+- `docs/05_EXPERIMENT_REPORT.md`：实验结果；
+- `docs/06_DEPLOYMENT.md`：CLI、API 与 Docker 配置；
+- `docs/07_REPRODUCIBILITY.md`：可复现性和审计说明；
+- `docs/08_COURSE_DEMO.md`：课程答辩演示流程。
 
-## 参考
+## 11. 参考与声明
 
-- 参考仓库：TauricResearch/TradingAgents
-- 论文：TradingAgents: Multi-Agents LLM Financial Trading Framework
+- 参考仓库：TauricResearch/TradingAgents；
+- 参考论文：TradingAgents: Multi-Agents LLM Financial Trading Framework；
+- 详细原创性边界见 `NOTICE.md`。

@@ -43,6 +43,9 @@ agents:
     provider: mock
     model: mock-critic-v1
     veto_on_invalid_evidence: true
+  regime:
+    enabled: true
+    mode: trailing_only
   fusion:
     quant_weight: 0.75
     context_weight: 0.25
@@ -52,6 +55,7 @@ agents:
     conflict_penalty: 0.70
 
 risk:
+  enabled: true
   max_position_weight: 0.20
   max_trade_weight: 0.10
   min_cash_weight: 0.10
