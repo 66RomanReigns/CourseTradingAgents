@@ -26,11 +26,17 @@ class LocalCsvProvider:
             bars: list[Bar] = []
             for row in reader:
                 timestamp = datetime.fromisoformat(row["timestamp"])
+                open_at = datetime.fromisoformat(row.get("open_at") or row["timestamp"])
                 available_at = datetime.fromisoformat(row.get("available_at") or row["timestamp"])
+                if open_at > timestamp:
+                    raise ValueError("open_at cannot be later than bar timestamp")
+                if available_at < timestamp:
+                    raise ValueError("available_at cannot be earlier than completed bar timestamp")
                 bars.append(
                     Bar(
                         symbol=self.symbol,
                         timestamp=timestamp,
+                        open_at=open_at,
                         open=float(row["open"]),
                         high=float(row["high"]),
                         low=float(row["low"]),
@@ -40,6 +46,8 @@ class LocalCsvProvider:
                     )
                 )
         bars.sort(key=lambda bar: bar.timestamp)
+        if any(bars[i].timestamp >= bars[i + 1].timestamp for i in range(len(bars) - 1)):
+            raise ValueError("bar timestamps must be strictly increasing")
         return bars
 
     @property

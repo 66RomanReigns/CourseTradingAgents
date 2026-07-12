@@ -75,4 +75,17 @@ MVP 不需要 GPU。只有在部署本地 LLM 时才使用 GPU。
 /home/amax/mcp-workspace/projects/trading-agent-course/reference
 ```
 
-由于 GitHub 网络认证限制，参考仓库当前未成功下载到服务器；设计分析来自公开仓库页面和源码页面。后续可以在网络认证完成后重新拉取，但本项目不会以复制该仓库为起点。
+用户随后上传了 `TradingAgents-main.zip`，现已解压到 `reference/TradingAgents`，并完成源码级核对。GitHub 直连限制仍然存在，但不再影响参考源码分析。
+
+## 6. Docker 构建限制
+
+2026-07-12 实际执行 `docker build` 时，Docker 守护进程尝试使用：
+
+```text
+HTTP Proxy:  http://127.0.0.1:17890
+HTTPS Proxy: http://127.0.0.1:17890
+```
+
+该代理端口当前没有服务，导致无法从 Docker Hub 拉取 `python:3.11-slim`。本机只缓存了 `ghcr.io/openclaw/openclaw:latest`，不适合作为本项目基础镜像，因此没有为了“构建成功”而使用无关的大型镜像。
+
+Dockerfile 与 Compose 配置已经完成，但镜像构建需要管理员修复 Docker daemon 代理或预先导入 Python 基础镜像。该问题不影响本地 Python、CLI 和 FastAPI 运行；API 已在 `127.0.0.1:18080` 完成真实 HTTP 冒烟测试。

@@ -15,6 +15,7 @@ class Action(str, Enum):
 class Bar:
     symbol: str
     timestamp: datetime
+    open_at: datetime
     open: float
     high: float
     low: float
@@ -45,13 +46,22 @@ class EvidencePack:
             raise ValueError(
                 f"future evidence rejected: {item.evidence_id} available at {item.available_at}"
             )
+        if item.evidence_id in self.ids:
+            raise ValueError(f"duplicate evidence id: {item.evidence_id}")
         self.evidence.append(item)
+
+    @property
+    def ids(self) -> set[str]:
+        return {item.evidence_id for item in self.evidence}
 
     def get_float(self, evidence_id: str, default: float = 0.0) -> float:
         for item in self.evidence:
             if item.evidence_id == evidence_id:
                 return float(item.value)
         return default
+
+    def by_kind(self, kind: str) -> list[Evidence]:
+        return [item for item in self.evidence if item.kind == kind]
 
 
 @dataclass(frozen=True)
@@ -62,6 +72,10 @@ class AgentOpinion:
     score: float
     rationale: str
     evidence_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.confidence <= 1.0:
+            raise ValueError("confidence must be in [0, 1]")
 
 
 @dataclass(frozen=True)
@@ -89,6 +103,10 @@ class Fill:
     fee: float
     timestamp: datetime
 
+    @property
+    def notional(self) -> float:
+        return abs(self.quantity) * self.price
+
 
 @dataclass
 class Portfolio:
@@ -101,3 +119,9 @@ class Portfolio:
 
     def equity(self, prices: dict[str, float]) -> float:
         return self.cash + self.market_value(prices)
+
+    def weight(self, symbol: str, prices: dict[str, float]) -> float:
+        equity = self.equity(prices)
+        if equity <= 0:
+            return 0.0
+        return self.positions.get(symbol, 0) * prices.get(symbol, 0.0) / equity

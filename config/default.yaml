@@ -33,22 +33,23 @@ agents:
       volume: 0.15
       volatility_penalty: 0.10
   context:
-    enabled: false
+    enabled: true
     provider: mock
     model: mock-context-v1
     temperature: 0.0
     require_evidence_ids: true
   critic:
-    enabled: false
+    enabled: true
     provider: mock
     model: mock-critic-v1
     veto_on_invalid_evidence: true
   fusion:
-    quant_weight: 0.70
-    context_weight: 0.30
-    buy_threshold: 0.35
-    sell_threshold: -0.35
-    conflict_penalty: 0.60
+    quant_weight: 0.75
+    context_weight: 0.25
+    min_confidence: 0.45
+    buy_threshold: 0.035
+    sell_threshold: -0.035
+    conflict_penalty: 0.70
 
 risk:
   max_position_weight: 0.20
@@ -71,8 +72,10 @@ broker:
   fractional_shares: false
 
 backtest:
-  rebalance_frequency: daily
-  warmup_days: 80
+  rebalance_frequency: signal_driven
+  warmup_days: 60
+  rebalance_threshold: 0.03
+  cooldown_bars: 3
   metrics:
     - cumulative_return
     - annualized_return
