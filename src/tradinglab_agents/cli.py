@@ -5,6 +5,8 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
+from tradinglab_agents.agents.llm import build_llm_client
+from tradinglab_agents.agents.research import MultiAgentResearchPipeline
 from tradinglab_agents.config import BacktestSettings, load_settings
 from tradinglab_agents.data.alpha_vantage import AlphaVantageNewsClient
 from tradinglab_agents.data.csv_provider import LocalCsvProvider
@@ -19,13 +21,21 @@ from tradinglab_agents.data.writers import (
     write_news_jsonl,
 )
 from tradinglab_agents.engine.backtest import BacktestEngine
+from tradinglab_agents.engine.features import FeatureEngine
+from tradinglab_agents.engine.multi_backtest import MultiAssetBacktestEngine
+from tradinglab_agents.paper.models import ApprovalPolicy, OrderStatus
+from tradinglab_agents.paper.scheduler import run_next_with_lock, run_session_with_lock
+from tradinglab_agents.paper.service import PaperTradingService
+from tradinglab_agents.reporting.paper_dashboard import render_paper_dashboard
 from tradinglab_agents.evaluation.benchmark_suite import run_scenario_benchmark, save_benchmark
 from tradinglab_agents.evaluation.experiments import (
     run_experiment_suite,
     save_experiment,
     save_run_bundle,
 )
+from tradinglab_agents.storage.paper_store import PaperTradingStore
 from tradinglab_agents.storage.run_store import RunStore
+from tradinglab_agents.workflows.daily import DailyWorkflow
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -73,6 +83,212 @@ def _run_backtest(args) -> None:
     print(f"full report: {output}")
 
 
+def _run_multi_backtest(args) -> None:
+    data_dir = Path(args.data_dir)
+    symbols = tuple(dict.fromkeys(symbol.upper() for symbol in args.symbols))
+    if len(symbols) < 2:
+        raise ValueError("multi-backtest requires at least two unique symbols")
+    providers: dict[str, LocalCsvProvider] = {}
+    news_providers: dict[str, LocalNewsProvider] = {}
+    for symbol in symbols:
+        price_path = data_dir / f"{symbol}.csv"
+        if not price_path.is_file():
+            raise ValueError(f"missing price file for {symbol}: {price_path}")
+        providers[symbol] = LocalCsvProvider(price_path, symbol)
+        news_path = data_dir / f"{symbol}_news.jsonl"
+        if news_path.is_file():
+            news_providers[symbol] = LocalNewsProvider(news_path)
+    evidence = [
+        LocalPointInTimeEvidenceProvider(path)
+        for path in (getattr(args, "evidence", None) or [])
+    ]
+    result = MultiAssetBacktestEngine(_settings(args)).run(
+        providers,
+        news_providers,
+        evidence_providers=evidence,
+    )
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(
+        json.dumps(result, ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8",
+    )
+    print(json.dumps(result["metrics"], ensure_ascii=False, indent=2))
+    print(f"symbols: {','.join(result['symbols'])}")
+    print(f"final gross exposure: {result['gross_exposure']:.2%}")
+    print(f"full report: {output}")
+
+
+def _paper_components(args) -> tuple[PaperTradingService, BacktestSettings, Path, Path]:
+    settings = _settings(args)
+    database = Path(getattr(args, "database", None) or settings.paper_database_path)
+    data_dir = Path(getattr(args, "data_dir", None) or settings.paper_data_dir)
+    service = PaperTradingService(PaperTradingStore(database), settings)
+    return service, settings, database, data_dir
+
+
+def _print_json(payload) -> None:
+    print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+
+
+def _run_paper_init(args) -> None:
+    service, settings, database, _ = _paper_components(args)
+    policy = ApprovalPolicy(
+        (args.approval_policy or settings.paper_approval_policy).upper()
+    )
+    account = service.initialize_account(
+        args.account,
+        name=args.name,
+        symbols=args.symbols,
+        initial_cash=args.cash,
+        approval_policy=policy,
+    )
+    _print_json(service.serialize_account(account))
+    print(f"paper database: {database}")
+    print("external broker: disabled")
+
+
+def _run_paper_account(args) -> None:
+    service, _, database, _ = _paper_components(args)
+    _print_json(service.account_summary(args.account))
+    print(f"paper database: {database}")
+
+
+def _run_paper_dashboard(args) -> None:
+    service, _, _, _ = _paper_components(args)
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(
+        render_paper_dashboard(service.account_summary(args.account)),
+        encoding="utf-8",
+    )
+    print(f"paper dashboard: {output}")
+    print("external broker: disabled")
+
+
+def _run_paper_orders(args) -> None:
+    service, _, _, _ = _paper_components(args)
+    statuses = [OrderStatus(value) for value in args.status] if args.status else None
+    orders = service.store.list_orders(
+        args.account,
+        statuses=statuses,
+        limit=args.limit,
+    )
+    _print_json([service.serialize_order(order) for order in orders])
+
+
+def _run_paper_memories(args) -> None:
+    service, _, _, _ = _paper_components(args)
+    memories = service.store.list_decision_memories(
+        args.account,
+        symbol=args.symbol,
+        outcome_status=args.outcome_status,
+        limit=args.limit,
+    )
+    _print_json(memories)
+
+
+def _run_paper_approve(args) -> None:
+    service, _, _, _ = _paper_components(args)
+    order = service.approve_order(
+        args.order_id,
+        reviewer=args.reviewer,
+        note=args.note,
+    )
+    _print_json(service.serialize_order(order))
+
+
+def _run_paper_reject(args) -> None:
+    service, _, _, _ = _paper_components(args)
+    order = service.reject_order(
+        args.order_id,
+        reviewer=args.reviewer,
+        note=args.note,
+    )
+    _print_json(service.serialize_order(order))
+
+
+def _run_paper_cancel(args) -> None:
+    service, _, _, _ = _paper_components(args)
+    order = service.cancel_order(
+        args.order_id,
+        actor=args.actor,
+        note=args.note,
+    )
+    _print_json(service.serialize_order(order))
+
+
+def _run_paper_approve_all(args) -> None:
+    service, _, _, _ = _paper_components(args)
+    orders = service.approve_all(args.account, reviewer=args.reviewer)
+    _print_json([service.serialize_order(order) for order in orders])
+
+
+def _run_paper_session(args) -> None:
+    service, settings, database, data_dir = _paper_components(args)
+    result = run_session_with_lock(
+        service,
+        args.account,
+        data_dir=data_dir,
+        session_date=args.session,
+        lock_path=settings.paper_lock_path,
+        evidence_paths=args.evidence,
+    )
+    _print_json(result)
+    print(f"paper database: {database}")
+    print("external broker: disabled")
+
+
+def _run_paper_next(args) -> None:
+    service, settings, database, data_dir = _paper_components(args)
+    result = run_next_with_lock(
+        service,
+        args.account,
+        data_dir=data_dir,
+        lock_path=args.lock_path or settings.paper_lock_path,
+        evidence_paths=args.evidence,
+    )
+    _print_json(result)
+    print(f"paper database: {database}")
+    print("external broker: disabled")
+
+
+def _run_workflow_plan(args) -> None:
+    settings = _settings(args)
+    workflow = DailyWorkflow(settings, PROJECT_ROOT)
+    _print_json(
+        workflow.plan(
+            mode=args.mode,
+            account_id=args.account,
+        )
+    )
+
+
+def _run_workflow(args) -> None:
+    settings = _settings(args)
+    workflow = DailyWorkflow(settings, PROJECT_ROOT)
+    result = workflow.execute(
+        mode=args.mode,
+        account_id=args.account,
+        confirm_live=args.confirm_live,
+        run_id=args.run_id,
+        resume=args.resume,
+    )
+    _print_json(result)
+    print(f"workflow artifact: {result['artifact']}")
+    print(f"workflow state: {result['workflow_state']}")
+    print(f"external requests enabled: {result['plan']['external_requests_enabled']}")
+    print("external broker: disabled")
+
+
+def _run_workflow_status(args) -> None:
+    settings = _settings(args)
+    state_path = Path(settings.workflow_artifact_dir) / args.run_id / "state.json"
+    if not state_path.is_file():
+        raise ValueError(f"workflow state not found: {state_path}")
+    _print_json(json.loads(state_path.read_text(encoding="utf-8")))
+
+
 def _run_experiment(args) -> None:
     prices, news, evidence = _provider(args)
     settings = _settings(args)
@@ -102,6 +318,33 @@ def _run_experiment(args) -> None:
     print(f"run bundle: {bundle['run_dir']}")
     print(f"html report: {bundle['html']}")
     print(f"database: {args.database}")
+
+
+def _run_research(args) -> None:
+    prices, news, evidence = _provider(args)
+    settings = _settings(args)
+    decision_bar = prices.bars[-1]
+    visible = prices.history(decision_bar.available_at)
+    pack = FeatureEngine().build(visible, decision_bar.available_at)
+    if news is not None:
+        news.add_to_pack(pack)
+    for provider in evidence:
+        provider.add_to_pack(pack)
+    client = build_llm_client(settings, PROJECT_ROOT)
+    result = MultiAgentResearchPipeline(client).run(
+        pack,
+        current_weight=args.current_weight,
+    )
+    payload = result.model_dump(mode="json")
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    print(f"research artifact: {output}")
+    print("execution: paper intent only; no broker order was submitted")
 
 
 def _run_benchmark(args) -> None:
@@ -232,6 +475,13 @@ def _add_fetch_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--force", action="store_true", help="ignore the HTTP cache")
 
 
+def _add_paper_common(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--account", default="demo-paper")
+    parser.add_argument("--database")
+    parser.add_argument("--data-dir")
+    parser.add_argument("--config", default="config/default.yaml")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="TradeLab-Agent course trading system")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -241,6 +491,184 @@ def main() -> None:
     backtest.add_argument("--output", default="artifacts/backtest.json")
     backtest.set_defaults(handler=_run_backtest)
 
+    multi = subparsers.add_parser(
+        "multi-backtest",
+        help="run one synchronized multi-asset portfolio backtest",
+    )
+    multi.add_argument("--data-dir", required=True)
+    multi.add_argument("--symbols", nargs="+", required=True)
+    multi.add_argument(
+        "--evidence",
+        action="append",
+        default=[],
+        help="shared point-in-time macro/fundamental JSONL; may be repeated",
+    )
+    multi.add_argument("--config", help="YAML configuration file")
+    multi.add_argument("--cash", type=float, help="override initial cash")
+    multi.add_argument("--output", default="artifacts/multi_backtest.json")
+    multi.set_defaults(handler=_run_multi_backtest)
+
+    paper_init = subparsers.add_parser(
+        "paper-init",
+        help="create a persistent internal paper account",
+    )
+    _add_paper_common(paper_init)
+    paper_init.add_argument("--name", default="TradeLab Paper Account")
+    paper_init.add_argument("--symbols", nargs="+", required=True)
+    paper_init.add_argument("--cash", type=float)
+    paper_init.add_argument(
+        "--approval-policy",
+        choices=[value.value for value in ApprovalPolicy],
+    )
+    paper_init.set_defaults(handler=_run_paper_init)
+
+    paper_account = subparsers.add_parser(
+        "paper-account",
+        help="show persistent paper account state",
+    )
+    _add_paper_common(paper_account)
+    paper_account.set_defaults(handler=_run_paper_account)
+
+    paper_dashboard = subparsers.add_parser(
+        "paper-dashboard",
+        help="render a local HTML paper account dashboard",
+    )
+    _add_paper_common(paper_dashboard)
+    paper_dashboard.add_argument(
+        "--output",
+        default="artifacts/paper_dashboard.html",
+    )
+    paper_dashboard.set_defaults(handler=_run_paper_dashboard)
+
+    paper_orders = subparsers.add_parser(
+        "paper-orders",
+        help="list paper order queue entries",
+    )
+    _add_paper_common(paper_orders)
+    paper_orders.add_argument(
+        "--status",
+        action="append",
+        choices=[value.value for value in OrderStatus],
+        default=[],
+    )
+    paper_orders.add_argument("--limit", type=int, default=200)
+    paper_orders.set_defaults(handler=_run_paper_orders)
+
+    paper_memories = subparsers.add_parser(
+        "paper-memories",
+        help="list immutable decisions and matured outcome reflections",
+    )
+    _add_paper_common(paper_memories)
+    paper_memories.add_argument("--symbol")
+    paper_memories.add_argument(
+        "--outcome-status",
+        choices=("PENDING", "MATURED"),
+    )
+    paper_memories.add_argument("--limit", type=int, default=100)
+    paper_memories.set_defaults(handler=_run_paper_memories)
+
+    paper_approve = subparsers.add_parser(
+        "paper-approve",
+        help="manually approve one queued paper order",
+    )
+    _add_paper_common(paper_approve)
+    paper_approve.add_argument("order_id")
+    paper_approve.add_argument("--reviewer", required=True)
+    paper_approve.add_argument("--note", default="")
+    paper_approve.set_defaults(handler=_run_paper_approve)
+
+    paper_reject = subparsers.add_parser(
+        "paper-reject",
+        help="manually reject one queued paper order",
+    )
+    _add_paper_common(paper_reject)
+    paper_reject.add_argument("order_id")
+    paper_reject.add_argument("--reviewer", required=True)
+    paper_reject.add_argument("--note", default="")
+    paper_reject.set_defaults(handler=_run_paper_reject)
+
+    paper_cancel = subparsers.add_parser(
+        "paper-cancel",
+        help="cancel one pending or approved paper order",
+    )
+    _add_paper_common(paper_cancel)
+    paper_cancel.add_argument("order_id")
+    paper_cancel.add_argument("--actor", required=True)
+    paper_cancel.add_argument("--note", default="")
+    paper_cancel.set_defaults(handler=_run_paper_cancel)
+
+    paper_approve_all = subparsers.add_parser(
+        "paper-approve-all",
+        help="approve all currently pending orders for an account",
+    )
+    _add_paper_common(paper_approve_all)
+    paper_approve_all.add_argument("--reviewer", required=True)
+    paper_approve_all.set_defaults(handler=_run_paper_approve_all)
+
+    paper_run = subparsers.add_parser(
+        "paper-run",
+        help="run one explicit synchronized paper session",
+    )
+    _add_paper_common(paper_run)
+    paper_run.add_argument("--session", required=True, help="YYYY-MM-DD")
+    paper_run.add_argument("--evidence", action="append", default=[])
+    paper_run.set_defaults(handler=_run_paper_session)
+
+    paper_next = subparsers.add_parser(
+        "paper-next",
+        help="run the next unprocessed paper session under a process lock",
+    )
+    _add_paper_common(paper_next)
+    paper_next.add_argument("--lock-path")
+    paper_next.add_argument("--evidence", action="append", default=[])
+    paper_next.set_defaults(handler=_run_paper_next)
+
+    workflow_plan = subparsers.add_parser(
+        "workflow-plan",
+        help="print the complete data/research/paper workflow without executing it",
+    )
+    workflow_plan.add_argument(
+        "--mode",
+        choices=("dry_run", "offline", "live"),
+    )
+    workflow_plan.add_argument("--account")
+    workflow_plan.add_argument("--config", default="config/default.yaml")
+    workflow_plan.set_defaults(handler=_run_workflow_plan)
+
+    workflow_run = subparsers.add_parser(
+        "workflow-run",
+        help="execute the daily workflow; dry_run is the safe default",
+    )
+    workflow_run.add_argument(
+        "--mode",
+        choices=("dry_run", "offline", "live"),
+    )
+    workflow_run.add_argument("--account")
+    workflow_run.add_argument(
+        "--run-id",
+        help="explicit run identifier; required with --resume",
+    )
+    workflow_run.add_argument(
+        "--resume",
+        action="store_true",
+        help="resume completed nodes from the matching run checkpoint",
+    )
+    workflow_run.add_argument(
+        "--confirm-live",
+        action="store_true",
+        help="required before any external data or LLM request is allowed",
+    )
+    workflow_run.add_argument("--config", default="config/default.yaml")
+    workflow_run.set_defaults(handler=_run_workflow)
+
+    workflow_status = subparsers.add_parser(
+        "workflow-status",
+        help="show checkpoint state for one workflow run",
+    )
+    workflow_status.add_argument("run_id")
+    workflow_status.add_argument("--config", default="config/default.yaml")
+    workflow_status.set_defaults(handler=_run_workflow_status)
+
     experiment = subparsers.add_parser("experiment", help="run baselines and ablations")
     _add_common(experiment)
     experiment.add_argument("--output", default="artifacts/experiment.json")
@@ -248,6 +676,20 @@ def main() -> None:
     experiment.add_argument("--runs-dir", default="artifacts/runs")
     experiment.add_argument("--database", default="artifacts/tradinglab.db")
     experiment.set_defaults(handler=_run_experiment)
+
+    research = subparsers.add_parser(
+        "research",
+        help="run the structured analyst/debate/manager/trader pipeline",
+    )
+    _add_common(research)
+    research.add_argument(
+        "--current-weight",
+        type=float,
+        default=0.0,
+        help="current paper portfolio weight for the research manager",
+    )
+    research.add_argument("--output", default="artifacts/research.json")
+    research.set_defaults(handler=_run_research)
 
     benchmark = subparsers.add_parser("benchmark", help="run deterministic market scenarios")
     benchmark.add_argument("--scenario-dir", default="data/scenarios")
@@ -314,7 +756,7 @@ def main() -> None:
     args = parser.parse_args()
     try:
         args.handler(args)
-    except (ValueError, OSError) as exc:
+    except (ValueError, OSError, RuntimeError) as exc:
         parser.exit(2, f"error: {exc}\n")
 
 

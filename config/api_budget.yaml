@@ -1,0 +1,85 @@
+timezone: America/New_York
+universe:
+  symbols: [SPY, QQQ, AAPL, MSFT, NVDA]
+
+providers:
+  twelve_data:
+    documented_free_limits:
+      api_credits_per_minute: 8
+      api_credits_per_day: 800
+    endpoint_credit_assumption:
+      time_series_per_symbol: 1
+    application_budget:
+      scheduled_runs_per_day: 1
+      symbols_per_run: 5
+      expected_credits_per_run: 5
+      maximum_credits_per_day: 20
+      reserve_credits_per_day: 780
+    schedule:
+      weekdays_only: true
+      local_time: "17:10"
+    cache_ttl_seconds: 43200
+    policy: "One incremental daily-bar request per symbol; never force-refresh twice on the same day."
+
+  alpha_vantage:
+    documented_free_limits:
+      requests_per_day: 25
+    application_budget:
+      scheduled_runs_per_day: 1
+      symbols_per_run: 5
+      expected_requests_per_run: 5
+      maximum_requests_per_day: 10
+      reserve_requests_per_day: 15
+    schedule:
+      weekdays_only: true
+      local_time: "17:25"
+    cache_ttl_seconds: 21600
+    policy: "One NEWS_SENTIMENT request per symbol after market close; reuse cached news during all agent runs."
+
+  fred:
+    documented_limits:
+      v2_requests_per_second: 2
+      v1_numeric_limit_published: false
+    application_budget:
+      maximum_series_per_refresh: 8
+      minimum_interval_seconds: 1.0
+      refreshes_per_day: 1
+    schedule:
+      weekdays_only: true
+      local_time: "18:00"
+    cache_ttl_seconds: 86400
+    policy: "Refresh only configured macro series; use one-second spacing and retain point-in-time vintages."
+
+  zhipu:
+    selected_model: glm-4.7-flash
+    official_status: "Free model"
+    endpoint: "https://open.bigmodel.cn/api/paas/v4"
+    application_budget:
+      maximum_requests_per_workflow: 14
+      candidate_symbols_per_workflow: 2
+      requests_per_candidate: 7
+    execution_policy:
+      default_mode: dry_run
+      live_requires_explicit_confirmation: true
+      thinking_mode: disabled
+    policy: "Run quant screening for the full universe, then use the structured seven-call research chain only for the top two candidates."
+
+  gemini:
+    identification: "AQ-prefixed key is treated as a likely Gemini authorization key, pending local validation."
+    documented_free_tier:
+      price: "Free for supported models; active RPM, TPM and RPD vary by model and project."
+      quota_source: "Google AI Studio active rate limits"
+      data_use: "Free-tier content may be used to improve Google products."
+    application_budget:
+      preferred_model: gemini-2.5-flash-lite
+      fallback_model: gemini-2.5-flash
+      maximum_requests_per_day: 10
+      maximum_requests_per_portfolio_run: 2
+    policy: "Disabled by default. Use only for one aggregated portfolio summary and one optional critic pass, never one full LLM pipeline per symbol."
+
+operational_rules:
+  - "All provider responses must be cached before strategy or agent execution."
+  - "A 429 response stops that provider's refresh for the current cycle; do not retry aggressively."
+  - "No provider key may appear in URLs, logs, reports, SQLite rows or Git-tracked files."
+  - "Alpha Vantage is the binding daily quota and determines the five-symbol universe size."
+  - "Backtests and tests remain offline and never consume external API quota."

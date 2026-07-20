@@ -1,23 +1,57 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Protocol
+import hashlib
+import json
+import os
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Protocol, TypeVar
+
+from pydantic import BaseModel
+
+from tradinglab_agents.agents.schemas import (
+    FundamentalAnalysis,
+    MacroAnalysis,
+    NewsAnalysis,
+    ResearchDecision,
+    TradePlan,
+)
+
+
+TModel = TypeVar("TModel", bound=BaseModel)
 
 
 class StructuredReasoner(Protocol):
-    def analyze_news(self, items: list[dict[str, str]]) -> dict:
-        """Return score [-1, 1], confidence [0, 1], rationale and evidence_ids."""
+    def analyze_news(self, items: list[dict[str, str]]) -> dict[str, Any]: ...
+
+    def analyze_macro(self, items: list[dict[str, str]]) -> dict[str, Any]: ...
+
+    def analyze_fundamentals(
+        self, items: list[dict[str, str]]
+    ) -> dict[str, Any]: ...
+
+
+class StructuredLLMClient(Protocol):
+    @property
+    def identity(self) -> str: ...
+
+    def complete(
+        self,
+        *,
+        task: str,
+        system_prompt: str,
+        payload: dict[str, Any],
+        response_model: type[TModel],
+    ) -> TModel: ...
 
 
 @dataclass
 class MockLLM:
-    """Offline deterministic stand-in for an LLM with structured output.
+    """Deterministic offline client implementing the production LLM contract."""
 
-    It deliberately exposes the same contract as a remote model so experiments
-    remain reproducible and the model can later be swapped without changing the
-    orchestration code.
-    """
-
+    model: str = "mock-research-v1"
     positive_words: tuple[str, ...] = (
         "beat",
         "growth",
@@ -29,6 +63,10 @@ class MockLLM:
         "partnership",
         "strong",
         "surge",
+        "expansion",
+        "improve",
+        "cooling inflation",
+        "rate cut",
     )
     negative_words: tuple[str, ...] = (
         "miss",
@@ -40,34 +78,482 @@ class MockLLM:
         "decline",
         "weak",
         "warning",
-        "cut",
+        "cut guidance",
+        "recession",
+        "inflation shock",
+        "default",
     )
 
-    def analyze_news(self, items: list[dict[str, str]]) -> dict:
+    @property
+    def identity(self) -> str:
+        return f"mock:{self.model}"
+
+    def _lexical_result(
+        self,
+        items: list[dict[str, str]],
+        *,
+        analysis_type: str,
+    ) -> dict[str, Any]:
         if not items:
             return {
+                "analysis_type": analysis_type,
                 "score": 0.0,
                 "confidence": 0.20,
-                "rationale": "no point-in-time news evidence",
+                "rationale": f"no point-in-time {analysis_type} evidence",
                 "evidence_ids": [],
+                "catalysts": [],
+                "risks": [],
             }
         raw = 0
         cited: list[str] = []
         matched: list[str] = []
+        catalysts: list[str] = []
+        risks: list[str] = []
         for item in items:
-            text = item["text"].lower()
+            text = str(item.get("text", "")).lower()
             positive = sum(word in text for word in self.positive_words)
             negative = sum(word in text for word in self.negative_words)
             delta = positive - negative
             if delta:
+                evidence_id = str(item["evidence_id"])
                 raw += delta
-                cited.append(item["evidence_id"])
-                matched.append(f"{item['evidence_id']}:{delta:+d}")
+                cited.append(evidence_id)
+                matched.append(f"{evidence_id}:{delta:+d}")
+                if delta > 0:
+                    catalysts.append(evidence_id)
+                else:
+                    risks.append(evidence_id)
         score = max(-1.0, min(1.0, raw / max(2.0, len(items))))
-        confidence = min(0.85, 0.30 + 0.12 * abs(raw) + 0.03 * len(items))
+        confidence = min(0.88, 0.30 + 0.12 * abs(raw) + 0.03 * len(items))
         return {
+            "analysis_type": analysis_type,
             "score": score,
             "confidence": confidence,
-            "rationale": "lexical structured reasoning " + (", ".join(matched) or "neutral"),
+            "rationale": (
+                f"deterministic {analysis_type} reasoning: "
+                + (", ".join(matched) or "neutral evidence")
+            ),
             "evidence_ids": cited,
+            "catalysts": catalysts,
+            "risks": risks,
         }
+
+    def analyze_news(self, items: list[dict[str, str]]) -> dict[str, Any]:
+        return self._lexical_result(items, analysis_type="news")
+
+    def analyze_macro(self, items: list[dict[str, str]]) -> dict[str, Any]:
+        return self._lexical_result(items, analysis_type="macro")
+
+    def analyze_fundamentals(
+        self, items: list[dict[str, str]]
+    ) -> dict[str, Any]:
+        return self._lexical_result(items, analysis_type="fundamental")
+
+    @staticmethod
+    def _all_evidence_ids(payload: dict[str, Any]) -> tuple[str, ...]:
+        ids: list[str] = []
+        for value in payload.values():
+            if isinstance(value, dict):
+                ids.extend(str(item) for item in value.get("evidence_ids", []))
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        ids.extend(
+                            str(evidence_id)
+                            for evidence_id in item.get("evidence_ids", [])
+                        )
+        return tuple(dict.fromkeys(ids))
+
+    def complete(
+        self,
+        *,
+        task: str,
+        system_prompt: str,
+        payload: dict[str, Any],
+        response_model: type[TModel],
+    ) -> TModel:
+        del system_prompt
+        if task == "news_analysis":
+            raw = self.analyze_news(list(payload.get("items", [])))
+        elif task == "macro_analysis":
+            raw = self.analyze_macro(list(payload.get("items", [])))
+        elif task == "fundamental_analysis":
+            raw = self.analyze_fundamentals(list(payload.get("items", [])))
+        elif task in {"bull_case", "bear_case"}:
+            analyses = list(payload.get("analyses", []))
+            scores = [float(item.get("score", 0.0)) for item in analyses]
+            average = sum(scores) / max(1, len(scores))
+            stance = "bull" if task == "bull_case" else "bear"
+            directional = max(0.0, average) if stance == "bull" else min(0.0, average)
+            if stance == "bull" and directional == 0.0:
+                directional = 0.05
+            if stance == "bear" and directional == 0.0:
+                directional = -0.05
+            confidence = min(
+                0.90,
+                0.40 + sum(float(item.get("confidence", 0.0)) for item in analyses)
+                / max(1, len(analyses))
+                * 0.45,
+            )
+            ids = self._all_evidence_ids({"analyses": analyses})
+            raw = {
+                "stance": stance,
+                "score": directional,
+                "confidence": confidence,
+                "thesis": f"offline {stance} synthesis from {len(analyses)} analyst reports",
+                "evidence_ids": ids,
+                "supporting_points": tuple(
+                    f"{item.get('analysis_type', 'analysis')} score={float(item.get('score', 0.0)):.3f}"
+                    for item in analyses
+                ),
+                "counterpoints": (
+                    "mock debate is deterministic and should not be treated as market truth",
+                ),
+            }
+        elif task == "research_manager":
+            bull = dict(payload.get("bull", {}))
+            bear = dict(payload.get("bear", {}))
+            net = (float(bull.get("score", 0.0)) + float(bear.get("score", 0.0))) / 2
+            confidence = min(
+                0.95,
+                (float(bull.get("confidence", 0.0)) + float(bear.get("confidence", 0.0)))
+                / 2,
+            )
+            if net > 0.12 and confidence >= 0.45:
+                action = "BUY"
+                target_weight = min(0.20, 0.05 + confidence * 0.15)
+            elif net < -0.12 and confidence >= 0.45:
+                action = "SELL"
+                target_weight = 0.0
+            else:
+                action = "HOLD"
+                target_weight = min(0.20, float(payload.get("current_weight", 0.0)))
+            raw = {
+                "action": action,
+                "confidence": confidence,
+                "target_weight": target_weight,
+                "thesis": f"research manager net debate score={net:.3f}",
+                "evidence_ids": tuple(
+                    dict.fromkeys(
+                        [
+                            *[str(item) for item in bull.get("evidence_ids", [])],
+                            *[str(item) for item in bear.get("evidence_ids", [])],
+                        ]
+                    )
+                ),
+                "dissent": tuple(str(item) for item in bear.get("counterpoints", [])),
+            }
+        elif task == "trader_plan":
+            decision = dict(payload.get("research_decision", {}))
+            action = str(decision.get("action", "HOLD"))
+            confidence = float(decision.get("confidence", 0.0))
+            if confidence < 0.45:
+                action = "HOLD"
+            target_weight = (
+                0.0
+                if action == "SELL"
+                else float(decision.get("target_weight", 0.0))
+            )
+            raw = {
+                "action": action,
+                "confidence": confidence,
+                "target_weight": target_weight,
+                "order_type": "NO_ORDER" if action == "HOLD" else "MARKET_NEXT_OPEN",
+                "rationale": "trader converted validated research into a paper-trading intent",
+                "evidence_ids": tuple(
+                    str(item) for item in decision.get("evidence_ids", [])
+                ),
+                "requires_human_approval": True,
+            }
+        else:
+            raise ValueError(f"unsupported mock LLM task: {task}")
+        return response_model.model_validate(raw)
+
+
+@dataclass
+class DryRunLLMClient:
+    """No-network client that exercises the complete structured LLM workflow.
+
+    It exposes the selected remote provider/model in its identity, but delegates
+    output generation to the deterministic MockLLM. This makes deployment,
+    caching, schema validation and call budgeting testable before any paid or
+    quota-limited request is enabled.
+    """
+
+    provider: str
+    model: str
+    delegate: MockLLM = field(default_factory=MockLLM)
+
+    @property
+    def identity(self) -> str:
+        return f"dry-run:{self.provider}:{self.model}"
+
+    def complete(
+        self,
+        *,
+        task: str,
+        system_prompt: str,
+        payload: dict[str, Any],
+        response_model: type[TModel],
+    ) -> TModel:
+        return self.delegate.complete(
+            task=task,
+            system_prompt=system_prompt,
+            payload=payload,
+            response_model=response_model,
+        )
+
+
+@dataclass
+class OpenAICompatibleClient:
+    """Structured client for OpenAI-compatible chat-completions endpoints."""
+
+    model: str
+    api_key: str
+    base_url: str | None = None
+    temperature: float = 0.0
+    timeout_seconds: float = 60.0
+    provider_name: str = "openai-compatible"
+    extra_body: dict[str, Any] = field(default_factory=dict)
+    _client: Any = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if not self.api_key:
+            raise ValueError("LLM API key is missing")
+        if not self.model:
+            raise ValueError("LLM model is missing")
+
+    @property
+    def identity(self) -> str:
+        endpoint = self.base_url or "openai-default"
+        return f"{self.provider_name}:{endpoint}:{self.model}"
+
+    def _get_client(self) -> Any:
+        if self._client is None:
+            try:
+                from openai import OpenAI
+            except ImportError as exc:
+                raise RuntimeError(
+                    "openai package is required for openai_compatible provider; "
+                    "install the llm extra"
+                ) from exc
+            kwargs: dict[str, Any] = {
+                "api_key": self.api_key,
+                "timeout": self.timeout_seconds,
+            }
+            if self.base_url:
+                kwargs["base_url"] = self.base_url
+            self._client = OpenAI(**kwargs)
+        return self._client
+
+    @staticmethod
+    def _strip_fence(content: str) -> str:
+        stripped = content.strip()
+        if stripped.startswith("```"):
+            lines = stripped.splitlines()
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            return "\n".join(lines).strip()
+        return stripped
+
+    def complete(
+        self,
+        *,
+        task: str,
+        system_prompt: str,
+        payload: dict[str, Any],
+        response_model: type[TModel],
+    ) -> TModel:
+        schema = response_model.model_json_schema()
+        user_content = json.dumps(
+            {
+                "task": task,
+                "input": payload,
+                "required_json_schema": schema,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        request: dict[str, Any] = {
+            "model": self.model,
+            "temperature": self.temperature,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+        }
+        if self.extra_body:
+            request["extra_body"] = dict(self.extra_body)
+        response = self._get_client().chat.completions.create(**request)
+        content = response.choices[0].message.content
+        if not content:
+            raise ValueError("LLM returned empty structured output")
+        return response_model.model_validate_json(self._strip_fence(content))
+
+
+@dataclass
+class CachedLLMClient:
+    delegate: StructuredLLMClient
+    cache_dir: Path
+    log_path: Path
+
+    @property
+    def identity(self) -> str:
+        return self.delegate.identity
+
+    def _cache_key(
+        self,
+        task: str,
+        system_prompt: str,
+        payload: dict[str, Any],
+        response_model: type[BaseModel],
+    ) -> str:
+        canonical = json.dumps(
+            {
+                "client": self.identity,
+                "task": task,
+                "system_prompt": system_prompt,
+                "payload": payload,
+                "schema": response_model.model_json_schema(),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+        return hashlib.sha256(canonical).hexdigest()
+
+    def _log(self, record: dict[str, Any]) -> None:
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.log_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+
+    def complete(
+        self,
+        *,
+        task: str,
+        system_prompt: str,
+        payload: dict[str, Any],
+        response_model: type[TModel],
+    ) -> TModel:
+        cache_key = self._cache_key(task, system_prompt, payload, response_model)
+        cache_path = self.cache_dir / f"{cache_key}.json"
+        started = time.perf_counter()
+        base_record = {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "task": task,
+            "client": self.identity,
+            "cache_key": cache_key,
+            "response_schema": response_model.__name__,
+        }
+        if cache_path.is_file():
+            result = response_model.model_validate_json(
+                cache_path.read_text(encoding="utf-8")
+            )
+            self._log(
+                {
+                    **base_record,
+                    "cache_hit": True,
+                    "duration_ms": round((time.perf_counter() - started) * 1000, 3),
+                    "status": "ok",
+                }
+            )
+            return result
+        try:
+            result = self.delegate.complete(
+                task=task,
+                system_prompt=system_prompt,
+                payload=payload,
+                response_model=response_model,
+            )
+        except Exception as exc:
+            self._log(
+                {
+                    **base_record,
+                    "cache_hit": False,
+                    "duration_ms": round((time.perf_counter() - started) * 1000, 3),
+                    "status": "error",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            raise
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        temporary = cache_path.with_suffix(".tmp")
+        temporary.write_text(result.model_dump_json(indent=2), encoding="utf-8")
+        temporary.replace(cache_path)
+        self._log(
+            {
+                **base_record,
+                "cache_hit": False,
+                "duration_ms": round((time.perf_counter() - started) * 1000, 3),
+                "status": "ok",
+            }
+        )
+        return result
+
+
+def build_llm_client(settings: Any, project_root: str | Path = ".") -> CachedLLMClient:
+    root = Path(project_root)
+    mode = settings.llm_execution_mode
+    provider = settings.llm_provider
+    if mode == "mock":
+        delegate: StructuredLLMClient = MockLLM(model="mock-research-v1")
+    elif mode == "dry_run":
+        delegate = DryRunLLMClient(provider=provider, model=settings.llm_model)
+    elif mode == "live":
+        api_key = os.environ.get(settings.llm_api_key_env, "")
+        base_url = os.environ.get(settings.llm_base_url_env) or None
+        if provider == "zhipu":
+            model = os.environ.get("ZHIPU_MODEL", settings.llm_model)
+            delegate = OpenAICompatibleClient(
+                model=model,
+                api_key=api_key,
+                base_url=base_url or "https://open.bigmodel.cn/api/paas/v4",
+                temperature=settings.llm_temperature,
+                timeout_seconds=settings.llm_timeout_seconds,
+                provider_name="zhipu",
+                extra_body={
+                    "thinking": {"type": settings.llm_thinking_mode},
+                },
+            )
+        elif provider == "openai_compatible":
+            delegate = OpenAICompatibleClient(
+                model=settings.llm_model,
+                api_key=api_key,
+                base_url=base_url,
+                temperature=settings.llm_temperature,
+                timeout_seconds=settings.llm_timeout_seconds,
+            )
+        elif provider == "mock":
+            delegate = MockLLM(model=settings.llm_model)
+        else:
+            raise ValueError(f"unsupported live LLM provider: {provider}")
+    else:
+        raise ValueError(f"unsupported LLM execution mode: {mode}")
+    cache_dir = Path(settings.llm_cache_dir)
+    log_path = Path(settings.llm_log_path)
+    if not cache_dir.is_absolute():
+        cache_dir = root / cache_dir
+    if not log_path.is_absolute():
+        log_path = root / log_path
+    return CachedLLMClient(delegate=delegate, cache_dir=cache_dir, log_path=log_path)
+
+
+__all__ = [
+    "CachedLLMClient",
+    "DryRunLLMClient",
+    "FundamentalAnalysis",
+    "MacroAnalysis",
+    "MockLLM",
+    "NewsAnalysis",
+    "OpenAICompatibleClient",
+    "ResearchDecision",
+    "StructuredLLMClient",
+    "StructuredReasoner",
+    "TradePlan",
+    "build_llm_client",
+]

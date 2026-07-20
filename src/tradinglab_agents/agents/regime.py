@@ -37,6 +37,31 @@ class RegimeGuardAgent:
         self._candidate_label: str | None = None
         self._candidate_count = 0
 
+    def export_state(self) -> dict[str, str | int | None]:
+        return {
+            "active_label": self._active_label,
+            "candidate_label": self._candidate_label,
+            "candidate_count": self._candidate_count,
+            "confirmation_bars": self.confirmation_bars,
+        }
+
+    def restore_state(self, state: dict | None) -> None:
+        if not state:
+            return
+        active = str(state.get("active_label", "transition"))
+        candidate_raw = state.get("candidate_label")
+        candidate = str(candidate_raw) if candidate_raw is not None else None
+        count = int(state.get("candidate_count", 0))
+        if active not in self.MULTIPLIERS:
+            raise ValueError(f"invalid regime active state: {active}")
+        if candidate is not None and candidate not in self.MULTIPLIERS:
+            raise ValueError(f"invalid regime candidate state: {candidate}")
+        if count < 0:
+            raise ValueError("regime candidate_count cannot be negative")
+        self._active_label = active
+        self._candidate_label = candidate
+        self._candidate_count = count
+
     @staticmethod
     def _classify(pack: EvidencePack) -> tuple[str, float, float, float]:
         momentum = pack.get_float("momentum.20d")

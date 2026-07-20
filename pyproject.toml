@@ -4,22 +4,27 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tradinglab-agents"
-version = "0.4.0"
-description = "A reproducible, course-oriented multi-agent paper trading system"
+version = "0.9.0"
+description = "A reproducible, auditable multi-agent paper trading research system"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11,<3.13"
 dependencies = [
-    "PyYAML>=6.0",
+    "PyYAML>=6.0,<7",
+    "pydantic>=2.7,<3",
 ]
 
 [project.optional-dependencies]
 api = [
-    "fastapi>=0.110",
-    "uvicorn>=0.29",
+    "fastapi>=0.110,<1",
+    "uvicorn>=0.29,<1",
+]
+llm = [
+    "openai>=1.40,<2",
 ]
 dev = [
-    "pytest>=8.0",
-    "httpx>=0.27",
+    "pytest>=8.0,<9",
+    "httpx>=0.27,<1",
+    "ruff>=0.5,<1",
 ]
 
 [project.scripts]
@@ -31,3 +36,19 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = [
+    "E402",  # scripts intentionally add src to sys.path before local imports
+    "E501",
+    "I001",  # preserve existing import layout outside the P0/P1 change set
+    "UP017",
+    "UP035",
+    "UP037",
+    "UP042",
+]

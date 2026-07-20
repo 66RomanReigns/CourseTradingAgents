@@ -1,0 +1,62 @@
+services:
+  api:
+    build: .
+    image: tradinglab-agent:0.9.0
+    command:
+      - uvicorn
+      - tradinglab_agents.api.app:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    environment:
+      TRADINGLAB_ROOT: /app
+    env_file:
+      - ${TRADINGLAB_KEYS_FILE:-/home/invalid/tradinglab.keys}
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./artifacts:/app/artifacts
+      - ./data/real:/app/data/real
+    restart: unless-stopped
+
+  workflow-dry-run:
+    build: .
+    image: tradinglab-agent:0.9.0
+    command:
+      - python
+      - -m
+      - tradinglab_agents.cli
+      - workflow-run
+      - --mode
+      - dry_run
+      - --config
+      - config/default.yaml
+    environment:
+      TRADINGLAB_ROOT: /app
+    volumes:
+      - ./artifacts:/app/artifacts
+      - ./data/real:/app/data/real
+    profiles: ["workflow"]
+
+  workflow-live:
+    build: .
+    image: tradinglab-agent:0.9.0
+    command:
+      - python
+      - -m
+      - tradinglab_agents.cli
+      - workflow-run
+      - --mode
+      - live
+      - --confirm-live
+      - --config
+      - config/default.yaml
+    environment:
+      TRADINGLAB_ROOT: /app
+    env_file:
+      - ${TRADINGLAB_KEYS_FILE:-/home/invalid/tradinglab.keys}
+    volumes:
+      - ./artifacts:/app/artifacts
+      - ./data/real:/app/data/real
+    profiles: ["live"]

@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -13,9 +14,12 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from tradinglab_agents.agents.llm import build_llm_client
 from tradinglab_agents.config import load_settings
 from tradinglab_agents.data.csv_provider import LocalCsvProvider
 from tradinglab_agents.data.news_provider import LocalNewsProvider
+from tradinglab_agents.storage.paper_store import PaperTradingStore
+from tradinglab_agents.workflows.daily import DailyWorkflow
 
 
 def _check_import(name: str) -> dict:
@@ -24,6 +28,49 @@ def _check_import(name: str) -> dict:
         return {"ok": True, "version": getattr(module, "__version__", "unknown")}
     except Exception as exc:
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _secret_file_status() -> dict:
+    path = Path(
+        os.environ.get(
+            "TRADINGLAB_KEYS_FILE",
+            Path.home() / ".config" / "tradinglab" / "tradinglab.keys",
+        )
+    )
+    required = {
+        "TWELVE_DATA_API_KEY",
+        "ALPHA_VANTAGE_API_KEY",
+        "FRED_API_KEY",
+        "GOOGLE_API_KEY",
+        "ZHIPU_API_KEY",
+        "TRADINGLAB_API_TOKEN",
+    }
+    if not path.is_file():
+        return {
+            "ok": False,
+            "severity": "warning",
+            "path": str(path),
+            "detail": "external secret file is not configured",
+        }
+    permissions = f"{path.stat().st_mode & 0o777:03o}"
+    configured: set[str] = set()
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, value = line.split("=", 1)
+        if value.strip().strip("'\""):
+            configured.add(name.strip())
+    missing = sorted(required.difference(configured))
+    return {
+        "ok": permissions == "600" and not missing,
+        "severity": "warning",
+        "path": str(path),
+        "permissions": permissions,
+        "configured_names": sorted(required.intersection(configured)),
+        "missing_names": missing,
+        "values_exposed": False,
+    }
 
 
 def _docker_status() -> dict:
@@ -54,16 +101,48 @@ def _docker_status() -> dict:
 def run_doctor() -> dict:
     checks: dict[str, dict] = {}
     checks["python"] = {
-        "ok": sys.version_info >= (3, 10),
+        "ok": sys.version_info[:2] == (3, 11),
         "version": sys.version.replace("\n", " "),
         "executable": sys.executable,
+        "required": "3.11.x",
     }
-    for name in ("yaml", "fastapi", "uvicorn"):
+    for name in (
+        "yaml",
+        "pydantic",
+        "fastapi",
+        "uvicorn",
+        "httpx",
+        "openai",
+        "pytest",
+    ):
         checks[f"import:{name}"] = _check_import(name)
+
+    checks["external_secrets"] = _secret_file_status()
+
+    lock_path = ROOT / "requirements.lock"
+    checks["dependency_lock"] = {
+        "ok": lock_path.is_file(),
+        "path": str(lock_path),
+    }
 
     try:
         settings = load_settings(ROOT / "config/default.yaml")
         checks["config"] = {"ok": True, "settings": settings.__dict__}
+        llm = build_llm_client(settings, ROOT)
+        checks["llm_execution"] = {
+            "ok": settings.llm_execution_mode != "live",
+            "execution_mode": settings.llm_execution_mode,
+            "identity": llm.identity,
+            "external_request": False,
+        }
+        workflow_plan = DailyWorkflow(settings, ROOT).plan()
+        checks["workflow_plan"] = {
+            "ok": not workflow_plan["external_requests_enabled"],
+            "mode": workflow_plan["mode"],
+            "planned_external_requests": workflow_plan["planned_external_requests"],
+            "planned_llm_calls": workflow_plan["remote_llm"]["planned_calls"],
+            "max_llm_calls": workflow_plan["remote_llm"]["max_calls_per_run"],
+        }
     except Exception as exc:
         checks["config"] = {"ok": False, "error": str(exc)}
 
@@ -87,6 +166,29 @@ def run_doctor() -> dict:
         checks["artifacts_writable"] = {"ok": True, "path": str(artifacts)}
     except Exception as exc:
         checks["artifacts_writable"] = {"ok": False, "error": str(exc)}
+
+    try:
+        with tempfile.TemporaryDirectory(dir=artifacts) as directory:
+            store = PaperTradingStore(Path(directory) / "paper-doctor.db")
+            store.create_account(
+                "doctor",
+                name="Doctor Probe",
+                initial_cash=1000.0,
+                symbols=("AAA", "BBB"),
+            )
+            restored = store.require_account("doctor")
+            checks["paper_sqlite"] = {
+                "ok": (
+                    restored.cash == 1000.0
+                    and restored.symbols == ("AAA", "BBB")
+                    and store.schema_version == store.CURRENT_SCHEMA_VERSION
+                ),
+                "journal": "WAL",
+                "schema_version": store.schema_version,
+                "supported_schema_version": store.CURRENT_SCHEMA_VERSION,
+            }
+    except Exception as exc:
+        checks["paper_sqlite"] = {"ok": False, "error": str(exc)}
 
     checks["docker"] = _docker_status()
     critical_failures = [

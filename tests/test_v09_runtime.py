@@ -1,0 +1,159 @@
+import json
+import os
+import sqlite3
+import tempfile
+import unittest
+from dataclasses import replace
+from pathlib import Path
+from unittest.mock import patch
+
+from fastapi.testclient import TestClient
+
+from tradinglab_agents.agents.analysts import MacroAnalystAgent, NewsAnalystAgent
+from tradinglab_agents.api.app import app
+from tradinglab_agents.config import load_settings
+from tradinglab_agents.paper.models import ApprovalPolicy
+from tradinglab_agents.paper.scheduler import account_lock_path
+from tradinglab_agents.paper.service import PaperTradingService
+from tradinglab_agents.storage.paper_store import PaperTradingStore
+from tradinglab_agents.workflows.daily import DailyWorkflow
+from tradinglab_agents.workflows.state import WorkflowExecutionError
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR = ROOT / "data" / "multi_sample"
+SETTINGS = load_settings(ROOT / "config" / "default.yaml")
+
+
+class ApiAuthenticationTest(unittest.TestCase):
+    def test_public_health_and_protected_routes(self):
+        client = TestClient(app)
+        with patch.dict(os.environ, {"TRADINGLAB_API_TOKEN": "operator-test-token"}):
+            self.assertEqual(client.get("/health").status_code, 200)
+            self.assertEqual(client.get("/workflow/plan").status_code, 401)
+            authorized = client.get(
+                "/workflow/plan",
+                headers={"X-API-Key": "operator-test-token"},
+            )
+            self.assertEqual(authorized.status_code, 200)
+            self.assertFalse(authorized.json()["external_requests_enabled"])
+
+    def test_missing_server_token_fails_closed(self):
+        client = TestClient(app)
+        with patch.dict(os.environ, {}, clear=True):
+            response = client.get("/workflow/plan")
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["required_env"], "TRADINGLAB_API_TOKEN")
+
+
+class DatabaseMigrationAndMemoryTest(unittest.TestCase):
+    def test_legacy_database_migrates_and_future_schema_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            legacy = Path(directory) / "legacy.db"
+            with sqlite3.connect(legacy) as connection:
+                connection.execute("PRAGMA user_version = 1")
+            store = PaperTradingStore(legacy)
+            self.assertEqual(store.schema_version, 2)
+            with sqlite3.connect(legacy) as connection:
+                row = connection.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name='paper_decision_memories'"
+                ).fetchone()
+            self.assertIsNotNone(row)
+
+            future = Path(directory) / "future.db"
+            with sqlite3.connect(future) as connection:
+                connection.execute("PRAGMA user_version = 99")
+            with self.assertRaisesRegex(RuntimeError, "newer than supported"):
+                PaperTradingStore(future)
+
+    def test_decisions_are_recorded_and_matured_without_llm(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = PaperTradingStore(Path(directory) / "paper.db")
+            service = PaperTradingService(store, SETTINGS)
+            service.initialize_account(
+                "memory-demo",
+                name="Memory Demo",
+                symbols=SETTINGS.workflow_symbols,
+                initial_cash=100_000.0,
+                approval_policy=ApprovalPolicy.NONE,
+            )
+            results = [
+                service.run_next_session("memory-demo", data_dir=DATA_DIR)
+                for _ in range(6)
+            ]
+            self.assertGreaterEqual(
+                sum(int(result["payload"]["memories_matured"]) for result in results),
+                1,
+            )
+            memories = store.list_decision_memories("memory-demo", limit=5000)
+            self.assertGreaterEqual(len(memories), 5)
+            matured = [row for row in memories if row["outcome_status"] == "MATURED"]
+            self.assertTrue(matured)
+            self.assertFalse(matured[0]["reflection"]["llm_generated"])
+            self.assertTrue(matured[0]["reflection"]["source_memory_immutable"])
+            self.assertIn(matured[0]["action"], {"BUY", "HOLD", "SELL"})
+
+
+class WorkflowResumeTest(unittest.TestCase):
+    def test_resume_skips_completed_research_agent_nodes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = replace(
+                SETTINGS,
+                workflow_artifact_dir=directory,
+                workflow_llm_candidate_limit=1,
+                llm_max_calls_per_run=7,
+            )
+            workflow = DailyWorkflow(settings, ROOT)
+            run_id = "workflow-resume-regression"
+            with patch.object(
+                MacroAnalystAgent,
+                "analyze",
+                side_effect=RuntimeError("injected macro failure"),
+            ):
+                with self.assertRaises(WorkflowExecutionError):
+                    workflow.execute(mode="dry_run", run_id=run_id)
+
+            state_path = Path(directory) / run_id / "state.json"
+            failed = json.loads(state_path.read_text(encoding="utf-8"))
+            candidates = json.loads(
+                (Path(directory) / run_id / "nodes" / "candidate_screen.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            symbol = candidates[0]["symbol"]
+            self.assertEqual(
+                failed["failed_node"],
+                f"research.{symbol}.macro_analyst",
+            )
+            self.assertIn(
+                f"research.{symbol}.news_analyst",
+                failed["completed_nodes"],
+            )
+
+            with patch.object(
+                NewsAnalystAgent,
+                "analyze",
+                side_effect=AssertionError("completed news node must not rerun"),
+            ):
+                result = workflow.execute(
+                    mode="dry_run",
+                    run_id=run_id,
+                    resume=True,
+                )
+            self.assertTrue(result["resumed"])
+            self.assertFalse(result["paper"]["mutated"])
+            completed = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(completed["status"], "COMPLETE")
+            self.assertIn(f"research.{symbol}.trader", completed["completed_nodes"])
+
+    def test_account_lock_paths_are_isolated_and_sanitized(self):
+        base = Path("artifacts/paper_scheduler.lock")
+        first = account_lock_path(base, "account-a")
+        second = account_lock_path(base, "account/b")
+        self.assertNotEqual(first, second)
+        self.assertNotIn("/", second.name)
+
+
+if __name__ == "__main__":
+    unittest.main()

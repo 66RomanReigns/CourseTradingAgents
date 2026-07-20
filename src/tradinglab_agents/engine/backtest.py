@@ -121,6 +121,8 @@ class BacktestEngine:
                         risk_decision.approved,
                         constrained_target,
                         f"{risk_decision.reason}; regime cap={exposure_cap:.2%} ({assessment.label})",
+                        force_execution=risk_decision.force_execution,
+                        state=risk_decision.state,
                     )
 
             next_bar = bars[index + 1]
@@ -136,7 +138,7 @@ class BacktestEngine:
                     or assessment.exposure_multiplier < 1.0
                 )
             )
-            should_rebalance = (
+            should_rebalance = risk_decision.force_execution or (
                 risk_decision.approved
                 and (intent.action != Action.HOLD or protective_trim)
                 and weight_change >= self.settings.rebalance_threshold
@@ -181,6 +183,8 @@ class BacktestEngine:
                     "target_weight": risk_decision.target_weight,
                     "current_weight_at_execution": current_weight,
                     "risk_reason": risk_decision.reason,
+                    "risk_state": risk_decision.state,
+                    "risk_force_execution": risk_decision.force_execution,
                     "regime": assessment.label,
                     "regime_exposure_multiplier": assessment.exposure_multiplier,
                     "regime_rationale": assessment.rationale,

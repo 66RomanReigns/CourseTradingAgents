@@ -1,10 +1,10 @@
 # TradeLab-Agent
 
-一个面向课程作业的、可复现且可审计的多智能体模拟交易系统。
+一个面向持续模拟盘目标、可复现且可审计的多智能体交易研究系统。
 
-当前版本：**v0.4.0**。
+当前版本：**v0.9.0（节点恢复 + 决策记忆 + API 认证）**。
 
-本项目参考 TauricResearch/TradingAgents 的“多角色协作分析”思想，但没有复制其十余个 LLM 角色、复杂 LangGraph 拓扑和多种在线数据接口。项目重新设计为一个更适合课程验收的混合系统：语言模型风格模块只处理非结构化上下文，行情计算、仓位控制、成交模拟与审计全部由确定性程序完成。
+本项目参考 TauricResearch/TradingAgents 的“多角色协作分析”目标，但没有复制其 LangGraph 拓扑或角色实现。v0.9.0 在 GLM-4.7-Flash dry-run 工作流上新增了原创的原子节点运行时：数据供应商和每个标的的七个研究角色都可独立恢复；模拟盘会保存不可变决策事实，并在本地观察期成熟后计算收益、基准收益与 Alpha；FastAPI 使用独立操作令牌，API、CLI 和调度器共用按账户文件锁。行情计算、仓位控制、成交模拟与审计仍由确定性程序负责，默认不访问外部 API。
 
 > 本项目只用于课程研究、软件工程演示和模拟盘实验，不构成投资建议，也不连接真实资金账户。
 
@@ -18,43 +18,57 @@ FRED 宏观 + SEC EDGAR 基本面
 点时缓存与统一 Data Provider
             │
             ▼
+同步 MarketSnapshot（缺价即失败）
+            │
+            ▼
 Feature Engine
             │
             ▼
       EvidencePack
             │
-     ┌──────┴──────┐
-     ▼             ▼
-Quant Agent   Context Agent
-     └──────┬──────┘
+   ┌────────┼────────┐
+   ▼        ▼        ▼
+ News     Macro   Fundamental
+ Analyst  Analyst    Analyst
+   └────────┼────────┘
             ▼
-      Decision Fusion
+      Bull / Bear Debate
             ▼
-       Critic Agent
+      Research Manager
             ▼
-    Regime Guard Agent
+          Trader
             ▼
-      Risk Governor
+ Quant/Fusion/Critic/Regime
             ▼
-       Paper Broker
+单标的 / 组合 Risk State Machine
+            │
             ▼
-回测、审计、SQLite、HTML 报告
+多资产 Paper Broker（先卖后买）
+            │
+            ▼
+节点级 Checkpoint、决策结果归因、单/多标的回测、持久模拟账本、HTML 报告与账户仪表板
 ```
 
 ### 智能体职责
 
 - **Quant Signal Agent**：计算动量、趋势、波动率和成交量因子，输出可解释量化意见。
-- **Context Agent**：通过可替换的结构化推理接口分析点时新闻、宏观和基本面证据。默认使用确定性 `MockLLM`，无 LLM API 也能复现。
+- **News / Macro / Fundamental Analysts**：分别使用独立输入结构、提示词和输出 Schema，不再把宏观与基本面伪装成新闻文本。
+- **Bull / Bear Researchers**：基于分析师结果构建相互对抗且可引用证据的多空观点。
+- **Research Manager**：综合分歧、证据质量和不确定性，输出 `BUY/HOLD/SELL` 与不超过 20% 的目标权重。
+- **Trader**：只生成下一交易日开盘的模拟订单意图，方向性操作始终要求人工审批，不连接真实资金。
+- **Context Agent**：保留给原回测链路的兼容接口，但内部已按新闻、宏观和基本面分流。
 - **Critic Agent**：检查证据引用、信号冲突和高波动风险，将不可靠意见降级为 HOLD。
 - **Regime Guard Agent**：根据仅使用历史数据识别牛市、熊市、震荡、高波动或过渡状态，只限制风险暴露，不主动制造买入信号。
-- **Risk Governor**：执行仓位上限、最低置信度和最大回撤等硬约束。
+- **Risk Governor**：使用 `ACTIVE → LIQUIDATING → HALTED` 粘性状态机执行仓位上限、最低置信度和最大回撤硬约束；组合版本进一步限制单标的权重、持仓数量和总暴露，所有保护性减仓均绕过策略阈值与冷却期。
+- **MarketSnapshot / Portfolio Valuation**：组合估值必须提供全部非零持仓价格，缺少任何标的都会立即失败，不再按零估值。
+- **Multi-Asset Paper Broker**：在同一个同步开盘快照上先执行减仓、再执行加仓，复用释放现金并禁止负现金。
 
 ## 2. 与参考项目的关键区别
 
 | 方面 | 参考项目 | TradeLab-Agent |
 |---|---|---|
-| 智能体数量 | 十余个分析、辩论、风险角色 | 4 个职责明确的分析/约束模块 |
-| LLM 依赖 | 主流程强依赖外部模型 | 默认离线 MockLLM，可替换但不强依赖 |
+| 智能体编排 | 多角色动态图与多轮讨论 | 七角色研究节点 + Quant/Critic/Regime，节点可恢复且硬风控独立 |
+| LLM 依赖 | 主流程强依赖外部模型 | 默认 GLM dry-run，不联网即可执行完整结构化链；live 需显式确认 |
 | 数据源 | 多个在线行情、新闻、社区和宏观接口 | Twelve Data、Alpha Vantage、FRED、SEC EDGAR，经统一缓存后转为本地点时数据 |
 | 风控 | 多角色语言讨论 | 确定性硬约束 |
 | 执行 | 侧重投资结论 | 完整目标仓位、手续费、滑点和持仓账本 |
@@ -69,13 +83,25 @@ Quant Agent   Context Agent
 cd /home/amax/mcp-workspace/projects/trading-agent-course/CourseTradingAgents
 ```
 
+创建并同步锁定的 Python 3.11 环境：
+
+```bash
+make sync
+```
+
 环境诊断：
 
 ```bash
 make doctor
 ```
 
-运行全部测试：
+运行全部测试和静态检查：
+
+```bash
+make check
+```
+
+仅运行全部测试：
 
 ```bash
 make test
@@ -86,6 +112,14 @@ make test
 ```bash
 make backtest
 ```
+
+运行 P2 五标的同步组合回测（离线合成数据，2018—2025）：
+
+```bash
+make multi-backtest
+```
+
+结果写入 `artifacts/multi_backtest.json`。数据由 `scripts/generate_multi_asset_data.py` 确定性生成，不是真实历史行情。
 
 运行基线与消融实验：
 
@@ -99,6 +133,50 @@ make experiment
 make benchmark
 ```
 
+运行完整结构化研究链（默认 GLM-4.7-Flash dry-run，不联网）：
+
+```bash
+make research
+```
+
+结果写入 `artifacts/research.json`，调用缓存和审计日志分别写入 `artifacts/llm_cache/` 与 `artifacts/llm_calls.jsonl`。
+
+配置外部数据密钥与检查免费额度预算：
+
+```bash
+make secrets-configure   # 静默输入 provider key，并生成本地 API 操作令牌
+make secrets-token       # 已有 key 文件时只补生成 API 操作令牌
+make secrets-check       # 只检查权限和变量名，不显示值
+make api-budget          # 验证五标的调用计划没有超过免费额度
+```
+
+真实密钥永远不进入仓库；详细额度和调度方案见 `docs/13_API_QUOTA_AND_SECRET_PLAN.md`。
+
+运行统一工作流：
+
+```bash
+make workflow-plan      # 查看将要调用的数据源、GLM 次数和安全状态
+make workflow-dry-run   # 完整执行本地研究链，外部请求 0，账户不变
+make workflow-offline   # 本地数据 + Mock 研究，可推进内部模拟账户
+```
+
+当前五标的先做 Quant 筛选，只对 Top-2 执行完整七角色研究链，最多 14 次计划调用。每个供应商和每个 Agent 都会生成独立节点产物；失败后使用 `workflow-run --run-id <id> --resume` 恢复，设置哈希不一致时拒绝拼接运行。真实模式只允许通过本地 CLI 显式执行 `workflow-run --mode live --confirm-live`，管理 API 不提供 live 开关。
+
+运行 P3 持久模拟盘闭环：
+
+```bash
+make paper-init       # 首次创建账户
+make paper-next       # 收盘生成下一开盘订单
+make paper-orders     # 查看审批队列
+make paper-approve-all
+make paper-next       # 下一交易日开盘执行已批准订单
+make paper-account
+make paper-dashboard
+PYTHONPATH=src .venv/bin/python -m tradinglab_agents.cli paper-memories --account demo-paper
+```
+
+默认审批策略为 `ALL`。未批准订单错过计划开盘后自动过期；所有账户、订单和成交仅写入 `artifacts/paper_trading.db`，项目没有真实券商连接。
+
 查看已存档实验：
 
 ```bash
@@ -107,14 +185,39 @@ make runs
 
 ## 4. CLI
 
-安装后可使用 `tradinglab`；未安装时可通过 `PYTHONPATH=src python3 -m tradinglab_agents.cli` 执行。
+安装后可使用 `tradinglab`；源码模式统一通过项目 `.venv` 执行，避免系统 Python 漂移。
 
 ```bash
-PYTHONPATH=src python3 -m tradinglab_agents.cli experiment \
+PYTHONPATH=src .venv/bin/python -m tradinglab_agents.cli experiment \
   --csv data/sample/demo.csv \
   --news data/sample/demo_news.jsonl \
   --config config/default.yaml
 ```
+
+多资产回测：
+
+```bash
+PYTHONPATH=src .venv/bin/python -m tradinglab_agents.cli multi-backtest \
+  --data-dir data/multi_sample \
+  --symbols SPY QQQ AAPL MSFT NVDA \
+  --config config/default.yaml
+```
+
+持久模拟盘命令：
+
+```bash
+PYTHONPATH=src .venv/bin/python -m tradinglab_agents.cli paper-init \
+  --account demo-paper --name "TradeLab Demo Paper" \
+  --symbols SPY QQQ AAPL MSFT NVDA --config config/default.yaml
+
+PYTHONPATH=src .venv/bin/python -m tradinglab_agents.cli paper-next \
+  --account demo-paper --config config/default.yaml
+
+PYTHONPATH=src .venv/bin/python -m tradinglab_agents.cli paper-approve-all \
+  --account demo-paper --reviewer local-user --config config/default.yaml
+```
+
+订单还可以通过 `paper-approve`、`paper-reject` 和 `paper-cancel` 单独处理。`paper-run --session YYYY-MM-DD` 可运行指定离线交易日；API、CLI 和调度器使用同一个按账户锁。`paper-memories` 可查看原始决策、观察期收益、相对基准 Alpha、失败类型和确定性反思。
 
 每次正式实验会生成：
 
@@ -133,6 +236,29 @@ artifacts/runs/<run_id>/
 artifacts/tradinglab.db
 ```
 
+### 4.1 GLM 执行模式
+
+默认配置已经选择：
+
+```yaml
+llm:
+  execution_mode: dry_run
+  provider: zhipu
+  model: glm-4.7-flash
+```
+
+`dry_run` 会执行七个角色、Schema 校验、缓存和审计，但由确定性 Mock 生成结果，不读取密钥、不访问网络。正式联调前先轮换所有曾在聊天中出现的密钥，再通过 `make secrets-configure` 静默写入项目外文件。
+
+真实调用入口：
+
+```bash
+scripts/with_api_keys.sh \
+  env PYTHONPATH=src .venv/bin/python -m tradinglab_agents.cli workflow-run \
+  --mode live --confirm-live --config config/default.yaml
+```
+
+任何模型输出都必须通过 Pydantic JSON Schema 和 Evidence ID 校验。GLM 只能作为保守覆盖层：可以 veto 加仓或触发减仓，但不能绕过量化确认、组合风控和人工审批。
+
 ## 5. FastAPI 演示
 
 启动：
@@ -141,10 +267,23 @@ artifacts/tradinglab.db
 make api
 ```
 
+除 `/`、`/health` 和 API 文档外，所有接口都要求 `X-API-Key` 或 Bearer Token；令牌保存在 `~/.config/tradinglab/tradinglab.keys` 的 `TRADINGLAB_API_TOKEN` 中，不得放进 URL 或日志。
+
 常用接口：
 
 - `GET /health`：环境和服务状态；
+- `GET /workflow/plan`：查看零调用工作流计划；
+- `POST /workflow/dry-run`：执行或恢复无网络、无账户修改的完整工作流；
+- `GET /workflow/runs/{run_id}`：查看节点级 checkpoint 状态；
 - `POST /backtest`：单次回测；
+- `POST /research`：运行 P1 分析师、Bull/Bear、Research Manager 与 Trader，只返回模拟意图；
+- `POST /paper/accounts`：创建内部持久模拟账户；
+- `GET /paper/accounts/{account_id}`：查看现金、持仓、订单、成交和净值；
+- `GET /paper/accounts/{account_id}/dashboard`：查看本地 HTML 仪表板；
+- `GET /paper/accounts/{account_id}/orders`：查看订单队列；
+- `GET /paper/accounts/{account_id}/memories`：查看决策与成熟结果归因；
+- `POST /paper/accounts/{account_id}/sessions`：运行指定或下一同步交易日；
+- `POST /paper/orders/{order_id}/approve|reject|cancel`：管理人工审批状态；
 - `POST /experiments`：基线和消融实验；
 - `GET /runs`：历史实验列表；
 - `GET /runs/{run_id}`：完整实验结果；
@@ -154,15 +293,12 @@ make api
 持久化实验示例：
 
 ```bash
-curl --noproxy '*' -X POST http://127.0.0.1:8000/experiments \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "csv_path": "data/sample/demo.csv",
-    "news_path": "data/sample/demo_news.jsonl",
-    "symbol": "DEMO",
-    "config_path": "config/default.yaml",
-    "persist": true
-  }'
+scripts/with_api_keys.sh bash -c '
+  curl --noproxy "*" -X POST http://127.0.0.1:8000/experiments \
+    -H "X-API-Key: $TRADINGLAB_API_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "{\"csv_path\":\"data/sample/demo.csv\",\"news_path\":\"data/sample/demo_news.jsonl\",\"symbol\":\"DEMO\",\"config_path\":\"config/default.yaml\",\"persist\":true}"
+'
 ```
 
 ## 6. 时间安全与审计
@@ -179,7 +315,11 @@ curl --noproxy '*' -X POST http://127.0.0.1:8000/experiments \
 2. 当日收盘形成信号，最早下一交易日开盘成交；
 3. 每条智能体意见必须引用当前 EvidencePack 中存在的 Evidence ID；
 4. 自动审计检查时间顺序、置信度、目标仓位和证据覆盖率；
-5. 输入文件、配置、Git 版本和 Python 环境写入 `manifest.json`。
+5. 多资产组合只在所有标的都存在的公共时间戳上决策和成交；
+6. 组合估值必须包含每个非零持仓的有效正价格；
+7. 输入文件、配置、Git 版本和 Python 环境写入 `manifest.json`；
+8. 工作流节点通过原子 JSON checkpoint 保存，恢复时强制校验配置哈希；
+9. 原始决策记忆不可变，收益归因和反思只能追加到结果字段。
 
 ## 7. 当前实验结论
 
@@ -193,6 +333,10 @@ curl --noproxy '*' -X POST http://127.0.0.1:8000/experiments \
 - 牛市场景因仓位受限，收益明显低于买入持有，体现了低风险暴露的代价。
 
 这些结果只说明系统逻辑与风险权衡在确定性场景中可验证，不证明真实市场盈利能力。详细结果见 `docs/05_EXPERIMENT_REPORT.md`。
+
+P2 的五标的离线组合验收使用 SPY、QQQ、AAPL、MSFT、NVDA 的合成数据覆盖 2018-01-02 至 2025-12-31，共 2087 个同步交易日。当前固定配置下，成交后最大总暴露约为 89.83%，最大单标的成交后权重约为 20.00%，负现金次数为 0；回撤触发后组合完整进入 `LIQUIDATING → HALTED`。这些数字用于验证软件约束，不代表真实策略表现。
+
+P3 CLI 闭环已验证：首日生成 5 个待审批订单，批量批准后下一同步开盘成交 5 笔；重新创建服务实例后现金和五标的持仓完整恢复，同一交易日重复运行不产生重复成交。另有故障注入测试验证：开盘成交已提交但收盘规划前崩溃时，重启从 `OPEN_EXECUTED` 阶段继续。
 
 ## 8. 免费真实数据 API
 
@@ -214,7 +358,7 @@ PYTHONPATH=src python3 -m tradinglab_agents.cli fetch-market \
 真实证据回测：
 
 ```bash
-PYTHONPATH=src python3 -m tradinglab_agents.cli experiment \
+PYTHONPATH=src .venv/bin/python -m tradinglab_agents.cli experiment \
   --csv data/real/SPY.csv \
   --news data/real/SPY_news.jsonl \
   --evidence data/real/macro.jsonl \
@@ -229,7 +373,8 @@ PYTHONPATH=src python3 -m tradinglab_agents.cli experiment \
 ```text
 CourseTradingAgents/
 ├── config/                 # YAML 配置
-├── data/sample/            # 主示例数据
+├── data/sample/            # 单标的主示例数据
+├── data/multi_sample/      # 可重建的五标的离线合成数据
 ├── data/scenarios/         # 四种确定性市场场景
 ├── docs/                   # 设计、实验、部署和答辩材料
 ├── scripts/                # 数据生成、转换和环境诊断
@@ -238,12 +383,14 @@ CourseTradingAgents/
 │   ├── api/                # FastAPI
 │   ├── broker/             # 模拟成交
 │   ├── data/               # 点时数据 Provider
-│   ├── engine/             # 特征、融合和回测编排
+│   ├── engine/             # 特征、同步市场快照、单/多标的回测编排
 │   ├── evaluation/         # 指标、基线、消融、审计和压力测试
 │   ├── reporting/          # Manifest 与 HTML 报告
-│   ├── risk/               # 确定性风控
-│   └── storage/            # SQLite 运行存档
+│   ├── risk/               # 单标的与组合级确定性风控
+│   ├── storage/            # SQLite 运行存档
+│   └── workflows/          # 数据、GLM 研究和模拟盘统一编排
 ├── tests/
+├── compose.yaml            # API、dry-run 与显式 live profiles
 ├── Makefile
 └── pyproject.toml
 ```
@@ -258,7 +405,14 @@ CourseTradingAgents/
 - `docs/05_EXPERIMENT_REPORT.md`：实验结果；
 - `docs/06_DEPLOYMENT.md`：CLI、API 与 Docker 配置；
 - `docs/07_REPRODUCIBILITY.md`：可复现性和审计说明；
-- `docs/08_COURSE_DEMO.md`：课程答辩演示流程。
+- `docs/08_COURSE_DEMO.md`：课程答辩演示流程；
+- `docs/09_FREE_DATA_APIS.md`：免费真实数据接口；
+- `docs/10_P0_P1_IMPLEMENTATION.md`：P0/P1 实施、验收与后续边界；
+- `docs/11_P2_MULTI_ASSET_IMPLEMENTATION.md`：P2 多资产设计、验收与 P3 边界。
+- `docs/12_P3_PAPER_TRADING_IMPLEMENTATION.md`：P3 持久模拟盘、审批、恢复、调度和 API。
+- `docs/13_API_QUOTA_AND_SECRET_PLAN.md`：API 密钥保存、免费额度、刷新日程和降级策略。
+- `docs/14_GLM_WORKFLOW_AND_PROJECT_REVIEW.md`：GLM 工作流、权限边界和全项目改进审查；
+- `docs/15_V09_RUNTIME_MEMORY_SECURITY.md`：节点恢复、决策记忆、数据库迁移、API 认证和统一账户锁。
 
 ## 11. 参考与声明
 
