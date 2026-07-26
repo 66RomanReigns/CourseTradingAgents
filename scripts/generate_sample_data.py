@@ -4,8 +4,10 @@ import csv
 import json
 import math
 import random
-from datetime import date, datetime, time, timedelta
+from datetime import date, timedelta
 from pathlib import Path
+
+from tradinglab_agents.engine.trading_calendar import ExchangeTradingCalendar
 
 SEED = 7
 SYMBOL = "DEMO"
@@ -16,20 +18,13 @@ news_path = root / "data" / "sample" / "demo_news.jsonl"
 price_path.parent.mkdir(parents=True, exist_ok=True)
 
 
-def business_days(start: date, count: int):
-    current = start
-    yielded = 0
-    while yielded < count:
-        if current.weekday() < 5:
-            yield current
-            yielded += 1
-        current += timedelta(days=1)
-
-
+calendar = ExchangeTradingCalendar("XNYS")
+sessions = calendar.sessions(date(2024, 1, 2), date(2025, 6, 30))[:260]
 price = 100.0
 rows = []
 news = []
-for index, day in enumerate(business_days(date(2024, 1, 2), 260)):
+for index, session in enumerate(sessions):
+    day = session.session_date
     if index < 90:
         drift, regime = 0.0010, "growth"
     elif index < 165:
@@ -43,8 +38,8 @@ for index, day in enumerate(business_days(date(2024, 1, 2), 260)):
     high = max(open_price, close) * (1 + abs(random.gauss(0, 0.005)))
     low = min(open_price, close) * (1 - abs(random.gauss(0, 0.005)))
     volume = 1_000_000 * (1 + abs(shock) * 18 + random.random() * 0.25)
-    open_at = datetime.combine(day, time(9, 30))
-    close_at = datetime.combine(day, time(16, 0))
+    open_at = session.open_at
+    close_at = session.close_at
     rows.append(
         [
             close_at.isoformat(),
@@ -69,8 +64,11 @@ for index, day in enumerate(business_days(date(2024, 1, 2), 260)):
         else:
             headline = "New product launch supports recovery and profit growth"
             summary = "Partnership approval and stronger demand improve the outlook."
-        published = datetime.combine(day, time(12, 30))
-        available = datetime.combine(day, time(12, 35))
+        published = min(
+            session.open_at + timedelta(hours=3),
+            session.close_at - timedelta(minutes=30),
+        )
+        available = published + timedelta(minutes=5)
         news.append(
             {
                 "event_id": f"evt-{index:03d}",

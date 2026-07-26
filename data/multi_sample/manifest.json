@@ -7,9 +7,14 @@
     "MSFT",
     "NVDA"
   ],
+  "calendar": "XNYS",
+  "timezone": "America/New_York",
   "start": "2018-01-02",
   "end": "2025-12-31",
-  "sessions": 2087,
+  "sessions": 2011,
+  "early_close_sessions": 18,
+  "corporate_action_count": 5,
+  "corporate_actions_are_synthetic": true,
   "seed": 20260720,
   "warning": "Synthetic data for deterministic software testing; not historical market data."
 }

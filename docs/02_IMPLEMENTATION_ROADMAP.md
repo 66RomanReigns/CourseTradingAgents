@@ -4,14 +4,23 @@
 
 项目已重新定位为“持续模拟盘增强版”，按 `P0 → P1 → P2 → P3 → P4` 推进。每个阶段都必须可运行、可测试，避免直到最后才形成闭环。
 
-### 当前状态（v0.9.0）
+### 当前状态（v0.18.0）
+
+- **P10 Market Semantics 已完成**：正式 XNYS 会话、完整同步、点时拆股/分红、总回报复权和 Paper schema v3 公司行动账本；
+- **P11 Provider Graph 已完成**：能力注册、持久健康状态、动态资源 fan-out、Twelve Data→Alpha Vantage→本地缓存路由、冲突解析、质量门控、共享节流、请求前额度预检和 DATA_PROVIDER thread 恢复均已完成。
 
 - **P0 已完成**：回撤熔断强制清仓、风险状态机、严格配置校验、Python 3.11 统一入口、精确依赖锁和测试入口修复；
 - **P1 已完成**：结构化 JSON Schema、分类型分析师、Bull/Bear、Research Manager、Trader、Evidence ID 校验、调用日志和缓存；
 - **P2 已完成**：严格多标的市场快照、缺价失败的组合估值、先卖后买的多资产模拟成交、组合级风险预算、同步五标的离线回测；
 - **P3 已完成**：持久模拟账户、订单队列、人工审批、过期处理、下一开盘执行、交易日锁、崩溃恢复、本地 API 和 HTML 仪表板；
 - **P4 运行时硬化已完成**：GLM-4.7-Flash provider、dry-run/offline/live 三模式、供应商与七角色节点级 checkpoint、设置哈希恢复保护、API Token 认证、SQLite v2 迁移、结构化决策记忆、五日收益/Alpha 归因和统一账户锁；
-- **P4 外部联调待完成**：最小真实数据与 GLM 请求验证、正式交易日历、额度账本、监控告警、备份恢复和 Docker daemon 代理修复。
+- **P4 Live Provider 安全层已完成**：无凭据校园网门户/TLS 检查、供应商调用账本、真实模型 token 遥测、最小冒烟入口、显式 fail-closed/last-known-good 策略、增量行情与新闻刷新；
+- **P5 LangChain/LangGraph 主运行时已完成**：LangChain Prompt/Runnable 与安全追踪、原生 LangGraph 并行分支、循环辩论、条件路由、SQLite thread checkpoint、pending-write 恢复、可选 interrupt/Command 人工审阅和双层审计；
+- **P6 组合级 Portfolio Supervisor 已完成**：跨标的相关性与集中度并行评审、deep Portfolio Supervisor、确定性 non-expansion guard、高相关簇限额、独立 PORTFOLIO thread、恢复测试和 CLI/API 图可视化；
+- **P7 顶层 Research Parent Graph 已完成**：Candidate Screening 进入原生 `Send` 动态 Top-K fan-out，候选子图完成后 fan-in 到 Portfolio Supervisor，独立 RESEARCH_PARENT thread、父级 pending-write 恢复、CLI/API 图可视化和顺序路径回退均已完成；
+- **P8 Workflow Core Graph 已完成**：数据验证、Research Parent、Overlay Assembly 和 Decision Preparation 进入独立 WORKFLOW_CORE thread；完整 Overlay 通过集合一致性、订单、审批、仓位上限和 non-expansion 校验后生成 SHA-256 交接哈希；
+- **P9 Deterministic Decision Graph 第一阶段已完成**：每个账户标的使用子图执行 Evidence、Quant、Fusion/Critic、Regime 与 Overlay Target，全部标的 fan-in 到 PortfolioRiskGovernor 和计划哈希；独立 DECISION thread、输入指纹、逐字段顺序等价、节点恢复和 Paper 决策记忆溯源均已完成；
+- **P11 后续成熟化待完成**：执行分阶段真实 Provider smoke test，加入行业/风格因子暴露约束、真实公司行动供应商适配、角色/模型收益归因、主动告警和备份恢复；Paper 审批、订单落库与执行是否迁入子图仍必须以数据库幂等和事务边界为前提。
 
 ## 2. 阶段 A：离线可复现 MVP
 
@@ -112,8 +121,8 @@
 ### 已完成运行时硬化
 
 1. 将远程研究 provider 配置为 `zhipu / glm-4.7-flash`，默认 `dry_run`，真实调用必须显式确认；
-2. 实现统一 `DailyWorkflow` 与每工作流最多 14 次模型调用的应用层预算；
-3. 将四个数据供应商和每个候选标的七个研究角色拆分为原子 checkpoint 节点；
+2. 实现统一 `DailyWorkflow`、Top-2 单标的 26 次调用与组合监督 3 次调用，共 29 次结构化调用的应用层预算；
+3. 将四类数据资源纳入独立 DATA_PROVIDER LangGraph，并将每个候选标的 13 个分层研究节点拆分为原子 checkpoint；
 4. 增加 `run_id` 恢复、完整设置 SHA-256 校验和失败节点定位；
 5. 实现行情、新闻、宏观和基本面的增量合并；
 6. 增加 FastAPI 操作令牌，缺少服务端令牌时非公共接口 fail closed；
@@ -128,8 +137,8 @@
 2. 修复 Docker daemon 代理并完成镜像构建；
 3. 增加 TLS、审批主体权限和令牌轮换流程；
 4. 增加 SQLite 自动备份、恢复演练和迁移回滚策略；
-5. 增加正式交易日历、节假日、提前收盘和停牌处理；
-6. 增加供应商额度账本、staging 数据审计和原子发布；
+5. 增加非 XNYS 资产元数据、停牌和代码变更处理；
+6. 完成真实 Provider smoke test、响应头额度校准、staging 数据审计和原子发布；
 7. 增加日志轮转、运行监控、健康告警和可选通知；
 8. 完成真实数据 walk-forward 与 LLM 增量价值消融。
 

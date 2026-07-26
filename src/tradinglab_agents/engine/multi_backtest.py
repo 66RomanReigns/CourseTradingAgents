@@ -9,12 +9,17 @@ from tradinglab_agents.agents.quant import QuantSignalAgent
 from tradinglab_agents.agents.regime import RegimeGuardAgent
 from tradinglab_agents.broker.paper import PaperBroker
 from tradinglab_agents.config import BacktestSettings
+from tradinglab_agents.data.corporate_actions import (
+    LocalCorporateActionProvider,
+    apply_corporate_actions,
+)
 from tradinglab_agents.data.csv_provider import LocalCsvProvider
 from tradinglab_agents.data.evidence_provider import LocalPointInTimeEvidenceProvider
 from tradinglab_agents.data.news_provider import LocalNewsProvider
 from tradinglab_agents.engine.features import FeatureEngine
 from tradinglab_agents.engine.fusion import DecisionFusion
 from tradinglab_agents.engine.market import AlignedMarketData
+from tradinglab_agents.engine.trading_calendar import ExchangeTradingCalendar
 from tradinglab_agents.evaluation.metrics import compute_metrics
 from tradinglab_agents.models import (
     Action,
@@ -37,8 +42,42 @@ class MultiAssetBacktestEngine:
         *,
         variant_name: str = "multi_asset_agent",
         evidence_providers: Sequence[LocalPointInTimeEvidenceProvider] | None = None,
+        corporate_action_providers: Mapping[
+            str, LocalCorporateActionProvider
+        ] | None = None,
     ) -> dict:
-        market = AlignedMarketData(providers)
+        calendar = ExchangeTradingCalendar(self.settings.market_calendar_name)
+        resolved_actions = dict(corporate_action_providers or {})
+        if (
+            corporate_action_providers is None
+            and self.settings.market_corporate_actions_enabled
+        ):
+            for symbol, provider in providers.items():
+                path = (
+                    provider.path.parent
+                    / f"{symbol.upper()}{self.settings.market_corporate_action_suffix}"
+                )
+                if path.is_file():
+                    resolved_actions[symbol.upper()] = LocalCorporateActionProvider(
+                        path,
+                        symbol,
+                        calendar=calendar,
+                    )
+        market = AlignedMarketData(
+            providers,
+            calendar=(calendar if self.settings.market_strict_sessions else None),
+            strict_session_times=self.settings.market_strict_session_times,
+            require_complete_alignment=(
+                self.settings.market_require_complete_alignment
+            ),
+            corporate_actions=resolved_actions,
+            adjust_history_for_splits=(
+                self.settings.market_adjust_history_for_splits
+            ),
+            adjust_history_for_dividends=(
+                self.settings.market_adjust_history_for_dividends
+            ),
+        )
         news_providers = {
             symbol.upper(): provider
             for symbol, provider in (news_providers or {}).items()
@@ -83,6 +122,7 @@ class MultiAssetBacktestEngine:
         decisions: list[dict] = []
         equity_curve: list[dict] = []
         portfolio_history: list[dict] = []
+        corporate_action_events: list[dict] = []
         last_fill_index = {symbol: -10_000 for symbol in market.symbols}
 
         for index in range(warmup, len(market.timestamps) - 1):
@@ -210,6 +250,24 @@ class MultiAssetBacktestEngine:
                 )
 
             execution_snapshot = market.open_snapshot(next_timestamp)
+            session_actions = market.actions_for_session(
+                next_timestamp.date(),
+                as_of=execution_snapshot.timestamp,
+            )
+            action_effects = apply_corporate_actions(
+                portfolio,
+                session_actions,
+                execution_snapshot.prices,
+            )
+            corporate_action_events.extend(
+                {
+                    **effect.as_dict(),
+                    "effective_at": execution_snapshot.timestamp.isoformat(),
+                    "paper_only": True,
+                    "external_broker": False,
+                }
+                for effect in action_effects
+            )
             current_execution_weights = portfolio.weights(
                 execution_snapshot,
                 set(market.symbols),
@@ -331,6 +389,8 @@ class MultiAssetBacktestEngine:
             "decisions": decisions,
             "equity_curve": equity_curve,
             "portfolio_history": portfolio_history,
+            "market_semantics": market.market_semantics(),
+            "corporate_action_events": corporate_action_events,
             "data_alignment": {
                 "common_sessions": len(market.timestamps),
                 "dropped_non_common_timestamps": market.dropped_timestamp_count,

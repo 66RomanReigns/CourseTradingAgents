@@ -5,8 +5,10 @@ import csv
 import json
 import math
 import random
-from datetime import datetime, time, timedelta
+from datetime import date, timedelta
 from pathlib import Path
+
+from tradinglab_agents.engine.trading_calendar import ExchangeTradingCalendar
 
 
 SCENARIOS = {
@@ -17,16 +19,6 @@ SCENARIOS = {
 }
 
 
-def business_days(start: datetime, count: int):
-    current = start
-    emitted = 0
-    while emitted < count:
-        if current.weekday() < 5:
-            yield current
-            emitted += 1
-        current += timedelta(days=1)
-
-
 def generate_scenario(name: str, output_dir: Path, rows: int, seed: int) -> tuple[Path, Path]:
     params = SCENARIOS[name]
     rng = random.Random(seed)
@@ -35,13 +27,16 @@ def generate_scenario(name: str, output_dir: Path, rows: int, seed: int) -> tupl
     news_path = output_dir / f"{name}_news.jsonl"
     price = 100.0
     anchor = 100.0
-    start = datetime(2023, 1, 3)
+    calendar = ExchangeTradingCalendar("XNYS")
+    sessions = calendar.sessions(date(2023, 1, 3), date(2025, 12, 31))[:rows]
+    if len(sessions) < rows:
+        raise ValueError(f"calendar returned only {len(sessions)} sessions for {rows} rows")
     csv_rows = []
     news_rows = []
 
-    for index, day in enumerate(business_days(start, rows)):
-        open_at = datetime.combine(day.date(), time(9, 30))
-        close_at = datetime.combine(day.date(), time(16, 0))
+    for index, session in enumerate(sessions):
+        open_at = session.open_at
+        close_at = session.close_at
         reversion = params["mean_reversion"] * (anchor / price - 1.0)
         cycle = 0.0015 * math.sin(index / 11.0)
         shock = rng.gauss(0.0, params["vol"])

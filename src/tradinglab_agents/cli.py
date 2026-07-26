@@ -3,9 +3,19 @@ from __future__ import annotations
 import argparse
 import json
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 
-from tradinglab_agents.agents.llm import build_llm_client
+from tradinglab_agents.agents.langgraph_research import (
+    LangGraphResearchRuntime,
+    ResearchGraphInterrupted,
+    inspect_research_thread,
+)
+from tradinglab_agents.agents.llm import MockLLM, build_llm_client
+from tradinglab_agents.agents.portfolio_supervisor import (
+    LangGraphPortfolioSupervisorRuntime,
+)
 from tradinglab_agents.agents.research import MultiAgentResearchPipeline
 from tradinglab_agents.config import BacktestSettings, load_settings
 from tradinglab_agents.data.alpha_vantage import AlphaVantageNewsClient
@@ -13,6 +23,7 @@ from tradinglab_agents.data.csv_provider import LocalCsvProvider
 from tradinglab_agents.data.evidence_provider import LocalPointInTimeEvidenceProvider
 from tradinglab_agents.data.fred import FredClient
 from tradinglab_agents.data.news_provider import LocalNewsProvider
+from tradinglab_agents.data.provider_registry import default_provider_registry
 from tradinglab_agents.data.sec_edgar import DEFAULT_US_GAAP_CONCEPTS, SecEdgarClient
 from tradinglab_agents.data.twelve_data import TwelveDataClient
 from tradinglab_agents.data.writers import (
@@ -21,8 +32,14 @@ from tradinglab_agents.data.writers import (
     write_news_jsonl,
 )
 from tradinglab_agents.engine.backtest import BacktestEngine
+from tradinglab_agents.engine.decision_graph import (
+    LangGraphDeterministicDecisionRuntime,
+)
 from tradinglab_agents.engine.features import FeatureEngine
 from tradinglab_agents.engine.multi_backtest import MultiAssetBacktestEngine
+from tradinglab_agents.engine.trading_calendar import ExchangeTradingCalendar
+from tradinglab_agents.engine.portfolio_planner import PortfolioPlanner
+from tradinglab_agents.models import EvidencePack
 from tradinglab_agents.paper.models import ApprovalPolicy, OrderStatus
 from tradinglab_agents.paper.scheduler import run_next_with_lock, run_session_with_lock
 from tradinglab_agents.paper.service import PaperTradingService
@@ -34,8 +51,18 @@ from tradinglab_agents.evaluation.experiments import (
     save_run_bundle,
 )
 from tradinglab_agents.storage.paper_store import PaperTradingStore
+from tradinglab_agents.storage.provider_health import ProviderHealthStore
+from tradinglab_agents.storage.provider_usage import ProviderUsageStore
 from tradinglab_agents.storage.run_store import RunStore
+from tradinglab_agents.workflows.data_provider_graph import (
+    LangGraphDataProviderRuntime,
+)
 from tradinglab_agents.workflows.daily import DailyWorkflow
+from tradinglab_agents.workflows.research_parent import (
+    LangGraphResearchParentRuntime,
+)
+from tradinglab_agents.workflows.smoke import ProviderSmokeRunner
+from tradinglab_agents.workflows.workflow_core import LangGraphWorkflowCoreRuntime
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -188,6 +215,55 @@ def _run_paper_memories(args) -> None:
     _print_json(memories)
 
 
+def _run_paper_actions(args) -> None:
+    service, _, _, _ = _paper_components(args)
+    _print_json(
+        service.store.list_corporate_action_events(
+            args.account,
+            limit=args.limit,
+        )
+    )
+
+
+def _run_market_calendar(args) -> None:
+    settings = _settings(args)
+    calendar = ExchangeTradingCalendar(
+        args.calendar or settings.market_calendar_name
+    )
+    payload = calendar.summary(args.start, args.end)
+    _print_json(payload)
+    if args.output:
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+        print(f"calendar report: {output}")
+
+
+def _run_market_validate(args) -> None:
+    settings = _settings(args)
+    if args.symbols:
+        settings = replace(
+            settings,
+            workflow_symbols=tuple(
+                dict.fromkeys(symbol.upper() for symbol in args.symbols)
+            ),
+        )
+    data_dir = Path(args.data_dir or settings.paper_data_dir)
+    payload = DailyWorkflow(settings, PROJECT_ROOT)._validate_local_data(data_dir)
+    _print_json(payload)
+    if args.output:
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+        print(f"market validation report: {output}")
+
+
 def _run_paper_approve(args) -> None:
     service, _, _, _ = _paper_components(args)
     order = service.approve_order(
@@ -281,6 +357,53 @@ def _run_workflow(args) -> None:
     print("external broker: disabled")
 
 
+def _run_provider_smoke(args) -> None:
+    settings = _settings(args)
+    result = ProviderSmokeRunner(settings, PROJECT_ROOT).run(
+        provider=args.provider,
+        symbol=args.symbol,
+        confirm_live=args.confirm_live,
+        run_id=args.run_id,
+    )
+    _print_json(result)
+    print("external broker: disabled")
+
+
+def _run_provider_usage(args) -> None:
+    settings = _settings(args)
+    path = Path(args.database or settings.workflow_provider_usage_database)
+    _print_json(ProviderUsageStore(path).summary(run_id=args.run_id))
+
+
+def _run_provider_capabilities(args) -> None:
+    _print_json(default_provider_registry().as_dict())
+
+
+def _run_provider_health(args) -> None:
+    settings = _settings(args)
+    path = Path(args.database or settings.workflow_provider_health_database)
+    store = ProviderHealthStore(path)
+    _print_json(
+        {
+            "database": str(path),
+            "providers": [item.as_dict() for item in store.list()],
+        }
+    )
+
+
+def _run_provider_events(args) -> None:
+    settings = _settings(args)
+    path = Path(args.database or settings.workflow_provider_health_database)
+    store = ProviderHealthStore(path)
+    _print_json(
+        {
+            "database": str(path),
+            "run_id": args.run_id,
+            "events": store.events(run_id=args.run_id, limit=args.limit),
+        }
+    )
+
+
 def _run_workflow_status(args) -> None:
     settings = _settings(args)
     state_path = Path(settings.workflow_artifact_dir) / args.run_id / "state.json"
@@ -320,7 +443,12 @@ def _run_experiment(args) -> None:
     print(f"database: {args.database}")
 
 
-def _run_research(args) -> None:
+def _project_path(value: str | Path) -> Path:
+    path = Path(value)
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def _research_pack(args) -> tuple[EvidencePack, BacktestSettings]:
     prices, news, evidence = _provider(args)
     settings = _settings(args)
     decision_bar = prices.bars[-1]
@@ -330,12 +458,104 @@ def _run_research(args) -> None:
         news.add_to_pack(pack)
     for provider in evidence:
         provider.add_to_pack(pack)
-    client = build_llm_client(settings, PROJECT_ROOT)
-    result = MultiAgentResearchPipeline(client).run(
-        pack,
-        current_weight=args.current_weight,
+    return pack, settings
+
+
+def _research_pipeline(
+    settings: BacktestSettings,
+    *,
+    human_review_mode: str | None = None,
+) -> MultiAgentResearchPipeline:
+    quick_client = build_llm_client(
+        settings,
+        PROJECT_ROOT,
+        model=settings.llm_quick_model,
+        cache_namespace="quick",
     )
-    payload = result.model_dump(mode="json")
+    deep_client = build_llm_client(
+        settings,
+        PROJECT_ROOT,
+        model=settings.llm_deep_model,
+        cache_namespace="deep",
+    )
+    return MultiAgentResearchPipeline(
+        quick_client,
+        deep_client,
+        debate_rounds=settings.workflow_debate_rounds,
+        risk_personas=settings.workflow_risk_personas,
+        use_langgraph=(settings.workflow_research_runtime == "langgraph"),
+        langchain_trace_path=_project_path(settings.workflow_langchain_trace_path),
+        langgraph_event_path=_project_path(settings.workflow_langgraph_event_path),
+        langgraph_retry_attempts=settings.workflow_langgraph_retry_attempts,
+        langgraph_node_timeout_seconds=(
+            settings.workflow_langgraph_node_timeout_seconds
+        ),
+        langgraph_cost_aware_routing=(
+            settings.workflow_langgraph_cost_aware_routing
+        ),
+        langgraph_hold_skip_confidence=(
+            settings.workflow_langgraph_hold_skip_confidence
+        ),
+        langgraph_human_review_mode=(
+            human_review_mode or settings.workflow_langgraph_human_review_mode
+        ),
+    )
+
+
+def _run_research(args) -> None:
+    pack, settings = _research_pack(args)
+    pipeline = _research_pipeline(
+        settings,
+        human_review_mode=args.human_review_mode,
+    )
+    if args.resume_decision and not args.thread_id:
+        raise ValueError("--thread-id is required with --resume-decision")
+    thread_id = args.thread_id or (
+        f"research:{pack.symbol}:{uuid4().hex}"
+    )
+    human_response = None
+    if args.resume_decision:
+        human_response = {"decision": args.resume_decision}
+        if args.resume_target is not None:
+            human_response["target_weight"] = args.resume_target
+    checkpointer = _project_path(
+        args.checkpoint_database
+        or settings.workflow_langgraph_checkpoint_database
+    )
+    try:
+        result = pipeline.run_resumable(
+            pack,
+            current_weight=args.current_weight,
+            node_runner=lambda _name, _model, function: function(),
+            thread_id=thread_id,
+            checkpointer_path=checkpointer,
+            resume=bool(args.resume_decision),
+            human_response=human_response,
+        )
+    except ResearchGraphInterrupted as exc:
+        execution = exc.execution
+        payload = {
+            "status": "WAITING_FOR_HUMAN_REVIEW",
+            "thread_id": execution.thread_id,
+            "interrupts": list(execution.interrupt_payloads),
+            "checkpoint_database": str(checkpointer),
+            "external_broker": False,
+        }
+    else:
+        execution = pipeline._last_graph_execution
+        payload = result.model_dump(mode="json")
+        payload["graph_runtime"] = (
+            {
+                "thread_id": execution.thread_id,
+                "checkpoint_count": execution.checkpoint_count,
+                "execution_path": list(execution.execution_path),
+                "stream_event_count": execution.event_count,
+                "human_review": execution.latest_state.get("human_review", {}),
+                "checkpoint_database": str(checkpointer),
+            }
+            if execution is not None
+            else {"runtime": "legacy_ablation"}
+        )
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(
@@ -345,6 +565,140 @@ def _run_research(args) -> None:
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     print(f"research artifact: {output}")
     print("execution: paper intent only; no broker order was submitted")
+
+
+def _research_graph(args) -> None:
+    settings = _settings(args)
+    pack = EvidencePack(
+        symbol=args.symbol.upper(),
+        decision_time=datetime.now(timezone.utc),
+    )
+    runtime = LangGraphResearchRuntime(
+        MockLLM(model=settings.llm_quick_model),
+        MockLLM(model=settings.llm_deep_model),
+        debate_rounds=settings.workflow_debate_rounds,
+        risk_personas=settings.workflow_risk_personas,
+        trace_path=_project_path(settings.workflow_langchain_trace_path),
+        event_path=_project_path(settings.workflow_langgraph_event_path),
+        retry_attempts=settings.workflow_langgraph_retry_attempts,
+        node_timeout_seconds=settings.workflow_langgraph_node_timeout_seconds,
+        cost_aware_routing=settings.workflow_langgraph_cost_aware_routing,
+        hold_skip_confidence=settings.workflow_langgraph_hold_skip_confidence,
+        human_review_mode=settings.workflow_langgraph_human_review_mode,
+    )
+    mermaid = runtime.mermaid(pack)
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(mermaid, encoding="utf-8")
+    print(mermaid)
+    print(f"research graph: {output}")
+
+
+def _portfolio_graph(args) -> None:
+    settings = _settings(args)
+    runtime = LangGraphPortfolioSupervisorRuntime(
+        MockLLM(model=settings.llm_quick_model),
+        MockLLM(model=settings.llm_deep_model),
+        trace_path=_project_path(settings.workflow_langchain_trace_path),
+        event_path=_project_path(settings.workflow_langgraph_event_path),
+        retry_attempts=settings.workflow_langgraph_retry_attempts,
+        max_gross_target=settings.max_gross_exposure,
+        max_positions=settings.max_positions,
+        high_correlation_threshold=(
+            settings.workflow_portfolio_high_correlation_threshold
+        ),
+        cluster_gross_cap=settings.workflow_portfolio_cluster_gross_cap,
+    )
+    mermaid = runtime.mermaid()
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(mermaid, encoding="utf-8")
+    print(mermaid)
+    print(f"portfolio graph: {output}")
+
+
+def _research_parent_graph(args) -> None:
+    settings = _settings(args)
+    runtime = LangGraphResearchParentRuntime(
+        event_path=_project_path(settings.workflow_langgraph_event_path)
+    )
+    mermaid = runtime.mermaid()
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(mermaid, encoding="utf-8")
+    print(mermaid)
+    print(f"research parent graph: {output}")
+
+
+def _data_provider_graph(args) -> None:
+    settings = _settings(args)
+    runtime = LangGraphDataProviderRuntime(
+        event_path=_project_path(settings.workflow_langgraph_event_path)
+    )
+    mermaid = runtime.mermaid()
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(mermaid, encoding="utf-8")
+    print(mermaid)
+    print(f"data provider graph: {output}")
+
+
+def _decision_graph(args) -> None:
+    settings = _settings(args)
+    runtime = LangGraphDeterministicDecisionRuntime(
+        PortfolioPlanner(settings),
+        event_path=_project_path(settings.workflow_langgraph_event_path),
+    )
+    mermaid = runtime.mermaid()
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(mermaid, encoding="utf-8")
+    print(mermaid)
+    print(f"decision graph: {output}")
+
+
+def _workflow_core_graph(args) -> None:
+    settings = _settings(args)
+    runtime = LangGraphWorkflowCoreRuntime(
+        event_path=_project_path(settings.workflow_langgraph_event_path)
+    )
+    mermaid = runtime.mermaid()
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(mermaid, encoding="utf-8")
+    print(mermaid)
+    print(f"workflow core graph: {output}")
+
+
+def _research_thread_status(args) -> None:
+    settings = _settings(args)
+    thread = args.thread_id.upper()
+    default_database = (
+        settings.workflow_provider_checkpoint_database
+        if thread.endswith(":DATA_PROVIDER")
+        else (
+            settings.workflow_core_checkpoint_database
+            if thread.endswith(":WORKFLOW_CORE")
+            else (
+            settings.workflow_decision_checkpoint_database
+            if thread.endswith(":DECISION")
+            else (
+                settings.workflow_research_parent_checkpoint_database
+                if thread.endswith(":RESEARCH_PARENT")
+                    else settings.workflow_langgraph_checkpoint_database
+                )
+            )
+        )
+    )
+    database = _project_path(args.database or default_database)
+    print(
+        json.dumps(
+            inspect_research_thread(database, args.thread_id),
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
+    )
 
 
 def _run_benchmark(args) -> None:
@@ -508,6 +862,27 @@ def main() -> None:
     multi.add_argument("--output", default="artifacts/multi_backtest.json")
     multi.set_defaults(handler=_run_multi_backtest)
 
+    market_calendar = subparsers.add_parser(
+        "market-calendar",
+        help="show exchange sessions and early closes without external requests",
+    )
+    market_calendar.add_argument("--start", required=True, help="YYYY-MM-DD")
+    market_calendar.add_argument("--end", required=True, help="YYYY-MM-DD")
+    market_calendar.add_argument("--calendar")
+    market_calendar.add_argument("--config", default="config/default.yaml")
+    market_calendar.add_argument("--output")
+    market_calendar.set_defaults(handler=_run_market_calendar)
+
+    market_validate = subparsers.add_parser(
+        "market-validate",
+        help="validate synchronized bars, exchange sessions and corporate actions",
+    )
+    market_validate.add_argument("--data-dir")
+    market_validate.add_argument("--symbols", nargs="+")
+    market_validate.add_argument("--config", default="config/default.yaml")
+    market_validate.add_argument("--output")
+    market_validate.set_defaults(handler=_run_market_validate)
+
     paper_init = subparsers.add_parser(
         "paper-init",
         help="create a persistent internal paper account",
@@ -566,6 +941,14 @@ def main() -> None:
     )
     paper_memories.add_argument("--limit", type=int, default=100)
     paper_memories.set_defaults(handler=_run_paper_memories)
+
+    paper_actions = subparsers.add_parser(
+        "paper-actions",
+        help="list idempotently posted split and dividend events",
+    )
+    _add_paper_common(paper_actions)
+    paper_actions.add_argument("--limit", type=int, default=100)
+    paper_actions.set_defaults(handler=_run_paper_actions)
 
     paper_approve = subparsers.add_parser(
         "paper-approve",
@@ -661,6 +1044,65 @@ def main() -> None:
     workflow_run.add_argument("--config", default="config/default.yaml")
     workflow_run.set_defaults(handler=_run_workflow)
 
+    provider_smoke = subparsers.add_parser(
+        "provider-smoke",
+        help="run one minimal real request per selected external provider",
+    )
+    provider_smoke.add_argument(
+        "--provider",
+        choices=(
+            "all",
+            "twelve_data",
+            "alpha_vantage",
+            "fred",
+            "sec_edgar",
+            "zhipu",
+        ),
+        default="all",
+    )
+    provider_smoke.add_argument("--symbol", default="AAPL")
+    provider_smoke.add_argument("--run-id")
+    provider_smoke.add_argument(
+        "--confirm-live",
+        action="store_true",
+        help="required before the credential-free network gate and real requests",
+    )
+    provider_smoke.add_argument("--config", default="config/default.yaml")
+    provider_smoke.set_defaults(handler=_run_provider_smoke)
+
+    provider_usage = subparsers.add_parser(
+        "provider-usage",
+        help="show secret-free provider call, status and quota-unit summaries",
+    )
+    provider_usage.add_argument("--run-id")
+    provider_usage.add_argument("--database")
+    provider_usage.add_argument("--config", default="config/default.yaml")
+    provider_usage.set_defaults(handler=_run_provider_usage)
+
+    provider_capabilities = subparsers.add_parser(
+        "provider-capabilities",
+        help="show the deterministic Provider Graph capability registry",
+    )
+    provider_capabilities.set_defaults(handler=_run_provider_capabilities)
+
+    provider_health = subparsers.add_parser(
+        "provider-health",
+        help="show persistent provider health and cooldown state",
+    )
+    provider_health.add_argument("--database")
+    provider_health.add_argument("--config", default="config/default.yaml")
+    provider_health.set_defaults(handler=_run_provider_health)
+
+    provider_events = subparsers.add_parser(
+        "provider-events",
+        help="show bounded provider health, fallback and conflict events",
+    )
+    provider_events.add_argument("--run-id")
+    provider_events.add_argument("--limit", type=int, default=200)
+    provider_events.add_argument("--database")
+    provider_events.add_argument("--config", default="config/default.yaml")
+    provider_events.set_defaults(handler=_run_provider_events)
+
     workflow_status = subparsers.add_parser(
         "workflow-status",
         help="show checkpoint state for one workflow run",
@@ -688,8 +1130,104 @@ def main() -> None:
         default=0.0,
         help="current paper portfolio weight for the research manager",
     )
+    research.add_argument(
+        "--human-review-mode",
+        choices=("paper_queue", "interrupt_directional"),
+        help="override the configured LangGraph human-review mode",
+    )
+    research.add_argument(
+        "--thread-id",
+        help="durable LangGraph thread; required when resuming an interrupt",
+    )
+    research.add_argument(
+        "--checkpoint-database",
+        help="override the LangGraph SQLite checkpoint database",
+    )
+    research.add_argument(
+        "--resume-decision",
+        choices=("approve", "reject", "reduce"),
+        help="resume an interrupted graph thread with a human decision",
+    )
+    research.add_argument(
+        "--resume-target",
+        type=float,
+        help="reduced BUY target used with --resume-decision reduce",
+    )
     research.add_argument("--output", default="artifacts/research.json")
     research.set_defaults(handler=_run_research)
+
+    research_graph = subparsers.add_parser(
+        "research-graph",
+        help="export the native LangGraph research topology as Mermaid",
+    )
+    research_graph.add_argument("--symbol", default="DEMO")
+    research_graph.add_argument("--config", default="config/default.yaml")
+    research_graph.add_argument("--output", default="artifacts/research_graph.mmd")
+    research_graph.set_defaults(handler=_research_graph)
+
+    portfolio_graph = subparsers.add_parser(
+        "portfolio-graph",
+        help="export the cross-asset LangGraph portfolio supervisor as Mermaid",
+    )
+    portfolio_graph.add_argument("--config", default="config/default.yaml")
+    portfolio_graph.add_argument(
+        "--output",
+        default="artifacts/portfolio_supervisor_graph.mmd",
+    )
+    portfolio_graph.set_defaults(handler=_portfolio_graph)
+
+    research_parent_graph = subparsers.add_parser(
+        "research-parent-graph",
+        help="export the top-level dynamic research parent graph as Mermaid",
+    )
+    research_parent_graph.add_argument("--config", default="config/default.yaml")
+    research_parent_graph.add_argument(
+        "--output",
+        default="artifacts/research_parent_graph.mmd",
+    )
+    research_parent_graph.set_defaults(handler=_research_parent_graph)
+
+    data_provider_graph = subparsers.add_parser(
+        "data-provider-graph",
+        help="export the checkpointed Provider Graph as Mermaid",
+    )
+    data_provider_graph.add_argument(
+        "--output",
+        default="artifacts/data_provider_graph.mmd",
+    )
+    data_provider_graph.add_argument("--config", default="config/default.yaml")
+    data_provider_graph.set_defaults(handler=_data_provider_graph)
+
+    workflow_core_graph = subparsers.add_parser(
+        "workflow-core-graph",
+        help="export the v0.15 workflow core graph as Mermaid",
+    )
+    workflow_core_graph.add_argument("--config", default="config/default.yaml")
+    workflow_core_graph.add_argument(
+        "--output",
+        default="artifacts/workflow_core_graph.mmd",
+    )
+    workflow_core_graph.set_defaults(handler=_workflow_core_graph)
+
+    decision_graph = subparsers.add_parser(
+        "decision-graph",
+        help="export the deterministic portfolio decision graph as Mermaid",
+    )
+    decision_graph.add_argument("--config", default="config/default.yaml")
+    decision_graph.add_argument(
+        "--output",
+        default="artifacts/decision_graph.mmd",
+    )
+    decision_graph.set_defaults(handler=_decision_graph)
+
+    research_thread = subparsers.add_parser(
+        "research-thread-status",
+        help="inspect one durable LangGraph research thread without model output",
+    )
+    research_thread.add_argument("thread_id")
+    research_thread.add_argument("--database")
+    research_thread.add_argument("--config", default="config/default.yaml")
+    research_thread.set_defaults(handler=_research_thread_status)
 
     benchmark = subparsers.add_parser("benchmark", help="run deterministic market scenarios")
     benchmark.add_argument("--scenario-dir", default="data/scenarios")

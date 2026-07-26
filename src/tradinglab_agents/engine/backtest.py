@@ -9,11 +9,16 @@ from tradinglab_agents.agents.quant import QuantSignalAgent
 from tradinglab_agents.agents.regime import RegimeAssessment, RegimeGuardAgent
 from tradinglab_agents.broker.paper import PaperBroker
 from tradinglab_agents.config import BacktestSettings
+from tradinglab_agents.data.corporate_actions import (
+    LocalCorporateActionProvider,
+    apply_corporate_actions,
+)
 from tradinglab_agents.data.csv_provider import LocalCsvProvider
 from tradinglab_agents.data.evidence_provider import LocalPointInTimeEvidenceProvider
 from tradinglab_agents.data.news_provider import LocalNewsProvider
 from tradinglab_agents.engine.features import FeatureEngine
 from tradinglab_agents.engine.fusion import DecisionFusion
+from tradinglab_agents.engine.trading_calendar import ExchangeTradingCalendar
 from tradinglab_agents.evaluation.metrics import compute_metrics
 from tradinglab_agents.models import Action, Portfolio, RiskDecision
 from tradinglab_agents.risk.governor import RiskGovernor
@@ -31,8 +36,30 @@ class BacktestEngine:
         news_provider: LocalNewsProvider | None = None,
         variant_name: str = "full_agent",
         evidence_providers: Sequence[LocalPointInTimeEvidenceProvider] | None = None,
+        corporate_action_provider: LocalCorporateActionProvider | None = None,
     ) -> dict:
         evidence_providers = tuple(evidence_providers or ())
+        calendar = ExchangeTradingCalendar(self.settings.market_calendar_name)
+        if self.settings.market_strict_sessions:
+            for bar in provider.bars:
+                calendar.validate_bar(
+                    bar,
+                    strict_times=self.settings.market_strict_session_times,
+                )
+        if (
+            corporate_action_provider is None
+            and self.settings.market_corporate_actions_enabled
+        ):
+            action_path = (
+                provider.path.parent
+                / f"{provider.symbol}{self.settings.market_corporate_action_suffix}"
+            )
+            if action_path.is_file():
+                corporate_action_provider = LocalCorporateActionProvider(
+                    action_path,
+                    provider.symbol,
+                    calendar=calendar,
+                )
         bars = list(provider.bars)
         warmup = max(20, self.settings.warmup_bars)
         if len(bars) <= warmup + 1:
@@ -68,10 +95,25 @@ class BacktestEngine:
         decisions: list[dict] = []
         equity_curve: list[dict] = []
         last_fill_index = -10_000
+        corporate_action_events: list[dict] = []
 
         for index in range(warmup, len(bars) - 1):
             decision_bar = bars[index]
             visible = provider.history(decision_bar.available_at)
+            if (
+                corporate_action_provider is not None
+                and self.settings.market_adjust_history_for_splits
+            ):
+                visible = corporate_action_provider.adjust_history(
+                    visible,
+                    decision_bar.available_at,
+                    include_splits=(
+                        self.settings.market_adjust_history_for_splits
+                    ),
+                    include_cash_dividends=(
+                        self.settings.market_adjust_history_for_dividends
+                    ),
+                )
             if len(visible) < 21:
                 continue
             pack = feature_engine.build(visible, decision_bar.available_at)
@@ -127,6 +169,25 @@ class BacktestEngine:
 
             next_bar = bars[index + 1]
             execution_prices = {provider.symbol: next_bar.open}
+            if corporate_action_provider is not None:
+                actions = corporate_action_provider.actions_for_session(
+                    next_bar.timestamp.date(),
+                    as_of=next_bar.open_at,
+                )
+                effects = apply_corporate_actions(
+                    portfolio,
+                    actions,
+                    execution_prices,
+                )
+                corporate_action_events.extend(
+                    {
+                        **effect.as_dict(),
+                        "effective_at": next_bar.open_at.isoformat(),
+                        "paper_only": True,
+                        "external_broker": False,
+                    }
+                    for effect in effects
+                )
             current_weight = portfolio.weight(provider.symbol, execution_prices)
             weight_change = abs(risk_decision.target_weight - current_weight)
             cooldown_ok = index - last_fill_index >= self.settings.cooldown_bars
@@ -213,4 +274,24 @@ class BacktestEngine:
             "fills": fills,
             "decisions": decisions,
             "equity_curve": equity_curve,
+            "market_semantics": {
+                "calendar": (
+                    calendar.summary(bars[0].timestamp.date(), bars[-1].timestamp.date())
+                    if self.settings.market_strict_sessions
+                    else None
+                ),
+                "strict_session_times": self.settings.market_strict_session_times,
+                "adjust_history_for_splits": (
+                    self.settings.market_adjust_history_for_splits
+                ),
+                "adjust_history_for_dividends": (
+                    self.settings.market_adjust_history_for_dividends
+                ),
+                "corporate_actions": (
+                    corporate_action_provider.summary()
+                    if corporate_action_provider is not None
+                    else None
+                ),
+            },
+            "corporate_action_events": corporate_action_events,
         }

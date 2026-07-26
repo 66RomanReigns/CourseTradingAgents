@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import os
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from tradinglab_agents.data.http_client import CachedHttpJsonClient, DataApiError, JsonHttpClient
 from tradinglab_agents.data.news_provider import NewsEvent
+from tradinglab_agents.engine.trading_calendar import ExchangeTradingCalendar
+from tradinglab_agents.models import Bar
 
 
 class AlphaVantageNewsClient:
@@ -55,6 +57,79 @@ class AlphaVantageNewsClient:
             ]
         )
         return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
+
+    def fetch_daily_bars(
+        self,
+        symbol: str,
+        *,
+        outputsize: str = "compact",
+        cache_ttl_seconds: int = 6 * 3600,
+        force_refresh: bool = False,
+        calendar_name: str = "XNYS",
+        start_date: str | date | None = None,
+        end_date: str | date | None = None,
+    ) -> list[Bar]:
+        normalized_output = outputsize.lower()
+        if normalized_output not in {"compact", "full"}:
+            raise ValueError("Alpha Vantage outputsize must be compact or full")
+        payload = self.http.get_json(
+            self.BASE_URL,
+            {
+                "function": "TIME_SERIES_DAILY",
+                "symbol": symbol.upper(),
+                "outputsize": normalized_output,
+                "apikey": self.api_key,
+            },
+            cache_ttl_seconds=cache_ttl_seconds,
+            force_refresh=force_refresh,
+        )
+        if "Information" in payload or "Note" in payload or "Error Message" in payload:
+            message = (
+                payload.get("Information")
+                or payload.get("Note")
+                or payload.get("Error Message")
+            )
+            raise DataApiError(f"Alpha Vantage error: {message}")
+        series = payload.get("Time Series (Daily)")
+        if not isinstance(series, dict):
+            raise DataApiError("Alpha Vantage daily time series must be an object")
+        lower = date.fromisoformat(str(start_date)) if start_date else None
+        upper = date.fromisoformat(str(end_date)) if end_date else None
+        calendar = ExchangeTradingCalendar(calendar_name)
+        bars: list[Bar] = []
+        for raw_day, row in series.items():
+            if not isinstance(row, dict):
+                continue
+            try:
+                session_date = date.fromisoformat(str(raw_day))
+                if lower and session_date < lower:
+                    continue
+                if upper and session_date > upper:
+                    continue
+                session = calendar.session(session_date)
+                bars.append(
+                    Bar(
+                        symbol=symbol.upper(),
+                        timestamp=session.close_at,
+                        open_at=session.open_at,
+                        open=float(row["1. open"]),
+                        high=float(row["2. high"]),
+                        low=float(row["3. low"]),
+                        close=float(row["4. close"]),
+                        volume=float(row.get("5. volume") or 0.0),
+                        available_at=session.close_at,
+                    )
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise DataApiError(
+                    f"invalid Alpha Vantage daily bar for {raw_day}: {exc}"
+                ) from exc
+        bars.sort(key=lambda item: item.timestamp)
+        if not bars:
+            raise DataApiError(
+                f"Alpha Vantage returned no daily bars for {symbol.upper()}"
+            )
+        return bars
 
     def fetch_news(
         self,

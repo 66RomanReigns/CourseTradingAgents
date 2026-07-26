@@ -1,0 +1,1 @@
+{"action_id": "qqq-synthetic-dividend-20240614", "action_type": "CASH_DIVIDEND", "effective_date": "2024-06-14", "cash_amount_per_share": 0.5, "symbol": "QQQ", "effective_at": "2024-06-14T09:30:00", "available_at": "2024-06-13T16:00:00", "currency": "USD", "source": "synthetic_multi_asset_fixture"}

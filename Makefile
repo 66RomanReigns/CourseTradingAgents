@@ -2,12 +2,19 @@ UV ?= uv
 PYTHON := .venv/bin/python
 RUFF := .venv/bin/ruff
 PYTHONPATH := src
+PYPI_INDEX ?= https://mirrors.nju.edu.cn/pypi/web/simple
+PROVIDER ?= twelve_data
+SYMBOL ?= AAPL
 
-.PHONY: sync doctor secrets-configure secrets-token secrets-check api-budget workflow-plan workflow-dry-run workflow-offline sample multi-sample scenarios test lint check backtest multi-backtest experiment benchmark runs research paper-init paper-next paper-account paper-dashboard paper-orders paper-approve-all api docker-build clean-artifacts
+.PHONY: lock sync doctor secrets-configure secrets-token secrets-check api-budget provider-smoke provider-usage provider-capabilities provider-health provider-events data-provider-graph market-calendar market-validate workflow-plan workflow-dry-run workflow-offline workflow-core-graph decision-graph research-graph research-parent-graph portfolio-graph sample multi-sample scenarios test lint check backtest multi-backtest experiment benchmark runs research paper-init paper-next paper-account paper-dashboard paper-orders paper-actions paper-approve-all api docker-build clean-artifacts
+
+lock:
+	$(UV) pip compile pyproject.toml --all-extras --python-version 3.11 \
+		--index-url $(PYPI_INDEX) --output-file requirements.lock
 
 sync:
 	$(UV) venv --python 3.11 --clear .venv
-	$(UV) pip sync --python $(PYTHON) requirements.lock
+	$(UV) pip sync --python $(PYTHON) requirements.lock --index-url $(PYPI_INDEX)
 
 doctor:
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/doctor.py
@@ -24,6 +31,45 @@ secrets-check:
 api-budget:
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/api_budget_report.py
 
+provider-smoke:
+	@test "$(CONFIRM_LIVE)" = "1" || (echo "set CONFIRM_LIVE=1 to allow one real provider smoke request" >&2; exit 2)
+	./scripts/with_api_keys.sh env PYTHONPATH=$(PYTHONPATH) $(PYTHON) \
+		-m tradinglab_agents.cli provider-smoke \
+		--provider $(PROVIDER) --symbol $(SYMBOL) --confirm-live \
+		--config config/default.yaml
+
+provider-usage:
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m tradinglab_agents.cli provider-usage \
+		--config config/default.yaml
+
+provider-capabilities:
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m tradinglab_agents.cli provider-capabilities
+
+provider-health:
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m tradinglab_agents.cli provider-health \
+		--config config/default.yaml
+
+provider-events:
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m tradinglab_agents.cli provider-events \
+		--config config/default.yaml
+
+data-provider-graph:
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m tradinglab_agents.cli data-provider-graph \
+		--config config/default.yaml \
+		--output artifacts/data_provider_graph.mmd
+
+market-calendar:
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m tradinglab_agents.cli market-calendar \
+		--start 2025-01-01 --end 2025-12-31 \
+		--config config/default.yaml \
+		--output artifacts/market_calendar.json
+
+market-validate: multi-sample
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m tradinglab_agents.cli market-validate \
+		--data-dir data/multi_sample \
+		--config config/default.yaml \
+		--output artifacts/market_validation.json
+
 workflow-plan:
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m tradinglab_agents.cli workflow-plan \
 		--config config/default.yaml
@@ -37,6 +83,31 @@ workflow-offline: multi-sample
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m tradinglab_agents.cli workflow-run \
 		--mode offline \
 		--config config/default.yaml
+
+research-graph:
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m tradinglab_agents.cli research-graph \
+		--config config/default.yaml \
+		--output artifacts/research_graph.mmd
+
+research-parent-graph:
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m tradinglab_agents.cli research-parent-graph \
+		--config config/default.yaml \
+		--output artifacts/research_parent_graph.mmd
+
+workflow-core-graph:
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m tradinglab_agents.cli workflow-core-graph \
+		--config config/default.yaml \
+		--output artifacts/workflow_core_graph.mmd
+
+decision-graph:
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m tradinglab_agents.cli decision-graph \
+		--config config/default.yaml \
+		--output artifacts/decision_graph.mmd
+
+portfolio-graph:
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m tradinglab_agents.cli portfolio-graph \
+		--config config/default.yaml \
+		--output artifacts/portfolio_supervisor_graph.mmd
 
 sample:
 	PYTHONPATH=$(PYTHONPATH) $(PYTHON) scripts/generate_sample_data.py

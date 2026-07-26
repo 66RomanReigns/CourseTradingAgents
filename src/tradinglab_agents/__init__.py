@@ -1,3 +1,3 @@
 """TradeLab-Agent: reproducible multi-agent paper trading framework."""
 
-__version__ = "0.9.0"
+__version__ = "0.18.0"

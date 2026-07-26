@@ -1,0 +1,1 @@
+{"action_id": "msft-synthetic-split-20230315", "action_type": "SPLIT", "effective_date": "2023-03-15", "split_ratio": 2.0, "symbol": "MSFT", "effective_at": "2023-03-15T09:30:00", "available_at": "2023-03-14T16:00:00", "currency": "USD", "source": "synthetic_multi_asset_fixture"}

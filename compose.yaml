@@ -1,7 +1,7 @@
 services:
   api:
     build: .
-    image: tradinglab-agent:0.9.0
+    image: tradinglab-agent:0.18.0
     command:
       - uvicorn
       - tradinglab_agents.api.app:app
@@ -22,7 +22,7 @@ services:
 
   workflow-dry-run:
     build: .
-    image: tradinglab-agent:0.9.0
+    image: tradinglab-agent:0.18.0
     command:
       - python
       - -m
@@ -41,7 +41,7 @@ services:
 
   workflow-live:
     build: .
-    image: tradinglab-agent:0.9.0
+    image: tradinglab-agent:0.18.0
     command:
       - python
       - -m

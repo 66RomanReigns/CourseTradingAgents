@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from collections.abc import Iterator, Mapping, Sequence
@@ -8,6 +9,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from tradinglab_agents.data.corporate_actions import (
+    CorporateAction,
+    apply_corporate_actions,
+)
 from tradinglab_agents.models import Fill, MarketSnapshot, Portfolio
 from tradinglab_agents.paper.models import (
     AccountStatus,
@@ -43,7 +48,7 @@ class PaperTradingStore:
     atomically so a process restart cannot create a partial execution ledger.
     """
 
-    CURRENT_SCHEMA_VERSION = 2
+    CURRENT_SCHEMA_VERSION = 3
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
@@ -249,6 +254,40 @@ class PaperTradingStore:
                     """
                 )
                 connection.execute("PRAGMA user_version = 2")
+                version = 2
+            if version < 3:
+                connection.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS paper_corporate_action_events (
+                        event_id TEXT PRIMARY KEY,
+                        account_id TEXT NOT NULL,
+                        run_id TEXT NOT NULL,
+                        action_id TEXT NOT NULL,
+                        symbol TEXT NOT NULL,
+                        action_type TEXT NOT NULL,
+                        effective_at TEXT NOT NULL,
+                        available_at TEXT NOT NULL,
+                        quantity_before INTEGER NOT NULL,
+                        quantity_after INTEGER NOT NULL,
+                        cash_delta REAL NOT NULL,
+                        fractional_shares REAL NOT NULL,
+                        reference_price REAL NOT NULL,
+                        payload_json TEXT NOT NULL,
+                        created_at_utc TEXT NOT NULL,
+                        UNIQUE (account_id, action_id),
+                        FOREIGN KEY (account_id) REFERENCES paper_accounts(account_id)
+                            ON DELETE CASCADE,
+                        FOREIGN KEY (run_id) REFERENCES paper_daily_runs(run_id)
+                            ON DELETE CASCADE
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_paper_corporate_actions_account_time
+                        ON paper_corporate_action_events(
+                            account_id, effective_at DESC
+                        );
+                    """
+                )
+                connection.execute("PRAGMA user_version = 3")
 
     @property
     def schema_version(self) -> int:
@@ -309,6 +348,14 @@ class PaperTradingStore:
                                 "regime_rationale": decision.get("regime_rationale"),
                                 "research_overlay_policy": decision.get(
                                     "research_overlay_policy"
+                                ),
+                                "research_trace": (
+                                    dict(decision.get("research_overlay") or {}).get(
+                                        "trace"
+                                    )
+                                ),
+                                "decision_graph": dict(
+                                    decision.get("decision_graph") or {}
                                 ),
                             }
                         ),
@@ -601,6 +648,157 @@ class PaperTradingStore:
         else:
             if context:
                 context.__exit__(None, None, None)
+
+    def apply_corporate_action_events(
+        self,
+        *,
+        account_id: str,
+        run_id: str,
+        actions: Sequence[CorporateAction],
+        reference_prices: Mapping[str, float],
+    ) -> list[dict[str, Any]]:
+        """Atomically apply previously unseen actions to one paper account."""
+
+        if not actions:
+            return []
+        with self._connection() as connection:
+            account_row = connection.execute(
+                "SELECT * FROM paper_accounts WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()
+            if account_row is None:
+                raise ValueError(f"paper account not found: {account_id}")
+            position_rows = connection.execute(
+                """
+                SELECT symbol, quantity FROM paper_positions
+                WHERE account_id = ? AND quantity != 0 ORDER BY symbol
+                """,
+                (account_id,),
+            ).fetchall()
+            positions = {
+                item["symbol"]: int(item["quantity"])
+                for item in position_rows
+            }
+            account = self._account_from_row(account_row, positions)
+            existing_ids = {
+                row["action_id"]
+                for row in connection.execute(
+                    """
+                    SELECT action_id FROM paper_corporate_action_events
+                    WHERE account_id = ?
+                    """,
+                    (account_id,),
+                ).fetchall()
+            }
+            pending = [
+                action for action in actions if action.action_id not in existing_ids
+            ]
+            if not pending:
+                return []
+            portfolio = Portfolio(
+                cash=account.cash,
+                positions=dict(account.positions),
+                peak_equity=account.peak_equity,
+            )
+            effects = apply_corporate_actions(
+                portfolio,
+                pending,
+                reference_prices,
+            )
+            action_lookup = {action.action_id: action for action in pending}
+            now = _utc_now().isoformat()
+            rows: list[dict[str, Any]] = []
+            for effect in effects:
+                action = action_lookup[effect.action_id]
+                payload = {
+                    "action": action.as_dict(),
+                    "effect": effect.as_dict(),
+                    "paper_only": True,
+                    "external_broker": False,
+                }
+                event_id = "cae-" + hashlib.sha256(
+                    f"{account_id}|{action.action_id}".encode()
+                ).hexdigest()[:24]
+                connection.execute(
+                    """
+                    INSERT INTO paper_corporate_action_events (
+                        event_id, account_id, run_id, action_id, symbol,
+                        action_type, effective_at, available_at,
+                        quantity_before, quantity_after, cash_delta,
+                        fractional_shares, reference_price, payload_json,
+                        created_at_utc
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event_id,
+                        account_id,
+                        run_id,
+                        action.action_id,
+                        action.symbol,
+                        action.action_type.value,
+                        action.effective_at.isoformat(),
+                        action.available_at.isoformat(),
+                        effect.quantity_before,
+                        effect.quantity_after,
+                        effect.cash_delta,
+                        effect.fractional_shares,
+                        effect.reference_price,
+                        _dump(payload),
+                        now,
+                    ),
+                )
+                rows.append({"event_id": event_id, **payload})
+            self.update_account_state(
+                account_id,
+                cash=portfolio.cash,
+                positions=portfolio.positions,
+                peak_equity=portfolio.peak_equity,
+                risk_state=account.risk_state,
+                strategy_state=account.strategy_state,
+                status=account.status,
+                last_session=account.last_session,
+                connection=connection,
+            )
+        return rows
+
+    def list_corporate_action_events(
+        self,
+        account_id: str,
+        *,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        if limit < 1 or limit > 5000:
+            raise ValueError("corporate action event limit must be in [1, 5000]")
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM paper_corporate_action_events
+                WHERE account_id = ?
+                ORDER BY effective_at DESC, action_id DESC
+                LIMIT ?
+                """,
+                (account_id, int(limit)),
+            ).fetchall()
+        return [
+            {
+                "event_id": row["event_id"],
+                "account_id": row["account_id"],
+                "run_id": row["run_id"],
+                "action_id": row["action_id"],
+                "symbol": row["symbol"],
+                "action_type": row["action_type"],
+                "effective_at": row["effective_at"],
+                "available_at": row["available_at"],
+                "quantity_before": int(row["quantity_before"]),
+                "quantity_after": int(row["quantity_after"]),
+                "cash_delta": float(row["cash_delta"]),
+                "fractional_shares": float(row["fractional_shares"]),
+                "reference_price": float(row["reference_price"]),
+                "payload": dict(_load(row["payload_json"], {})),
+                "created_at_utc": row["created_at_utc"],
+            }
+            for row in rows
+        ]
 
     def begin_daily_run(
         self,

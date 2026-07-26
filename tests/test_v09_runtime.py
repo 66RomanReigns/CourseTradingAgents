@@ -53,19 +53,121 @@ class DatabaseMigrationAndMemoryTest(unittest.TestCase):
             with sqlite3.connect(legacy) as connection:
                 connection.execute("PRAGMA user_version = 1")
             store = PaperTradingStore(legacy)
-            self.assertEqual(store.schema_version, 2)
+            self.assertEqual(store.schema_version, 3)
             with sqlite3.connect(legacy) as connection:
                 row = connection.execute(
                     "SELECT name FROM sqlite_master "
                     "WHERE type='table' AND name='paper_decision_memories'"
                 ).fetchone()
+                corporate_row = connection.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name='paper_corporate_action_events'"
+                ).fetchone()
             self.assertIsNotNone(row)
+            self.assertIsNotNone(corporate_row)
 
             future = Path(directory) / "future.db"
             with sqlite3.connect(future) as connection:
                 connection.execute("PRAGMA user_version = 99")
             with self.assertRaisesRegex(RuntimeError, "newer than supported"):
                 PaperTradingStore(future)
+
+    def test_research_trace_is_preserved_and_attributed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = PaperTradingStore(Path(directory) / "paper.db")
+            service = PaperTradingService(store, SETTINGS)
+            account_id = "trace-demo"
+            service.initialize_account(
+                account_id,
+                name="Trace Demo",
+                symbols=SETTINGS.workflow_symbols,
+                initial_cash=100_000.0,
+                approval_policy=ApprovalPolicy.NONE,
+            )
+            market, _ = service.load_market(DATA_DIR, SETTINGS.workflow_symbols)
+            decision_timestamp = market.timestamps[60]
+            outcome_timestamp = market.timestamps[61]
+            run_id = "paper-trace-demo"
+            store.begin_daily_run(
+                run_id=run_id,
+                account_id=account_id,
+                session_date=decision_timestamp.date().isoformat(),
+                open_at=market.open_snapshot(decision_timestamp).timestamp,
+                close_at=market.close_snapshot(decision_timestamp).timestamp,
+            )
+            trace = {
+                "graph_version": "tiered_research_graph_v1",
+                "clients": {"quick": "mock:quick", "deep": "mock:deep"},
+                "debate_rounds": [{"round_index": 1}, {"round_index": 2}],
+                "preliminary_trader": {"action": "BUY"},
+                "risk_reviews": [
+                    {"persona": "balanced", "verdict": "REDUCE"},
+                    {"persona": "conservative", "verdict": "VETO"},
+                ],
+                "portfolio_manager": {"action": "HOLD"},
+            }
+            store.record_decision_memories(
+                account_id=account_id,
+                run_id=run_id,
+                decision_time=market.decision_time(decision_timestamp).isoformat(),
+                market_timestamp=decision_timestamp.isoformat(),
+                symbol_decisions={
+                    "SPY": {
+                        "final_action": "HOLD",
+                        "confidence": 0.6,
+                        "current_weight_at_decision": 0.0,
+                        "proposed_target_weight": 0.0,
+                        "evidence_ids": [],
+                        "research_overlay": {"trace": trace},
+                        "research_overlay_policy": "committee veto",
+                    }
+                },
+                approved_targets={"SPY": 0.0},
+                benchmark_symbol="QQQ",
+                horizon_sessions=1,
+            )
+            pending = store.list_decision_memories(account_id)[0]
+            self.assertEqual(
+                pending["rationale"]["research_trace"]["graph_version"],
+                "tiered_research_graph_v1",
+            )
+            self.assertEqual(
+                service._mature_decision_memories(
+                    account_id,
+                    market,
+                    outcome_timestamp,
+                ),
+                1,
+            )
+            matured = store.list_decision_memories(account_id)[0]
+            attribution = matured["reflection"]["research_attribution"]
+            self.assertTrue(attribution["decision_changed_by_committee"])
+            self.assertEqual(attribution["veto_count"], 1)
+            self.assertEqual(attribution["debate_rounds"], 2)
+
+            workflow = DailyWorkflow(
+                replace(
+                    SETTINGS,
+                    paper_database_path=str(store.path),
+                    workflow_memory_feedback_limit=5,
+                ),
+                ROOT,
+            )
+            self.assertEqual(
+                workflow._decision_memory_context(
+                    account_id=account_id,
+                    symbol="SPY",
+                    decision_time=decision_timestamp,
+                ),
+                [],
+            )
+            visible = workflow._decision_memory_context(
+                account_id=account_id,
+                symbol="SPY",
+                decision_time=outcome_timestamp,
+            )
+            self.assertEqual(len(visible), 1)
+            self.assertEqual(visible[0]["memory_id"], matured["memory_id"])
 
     def test_decisions_are_recorded_and_matured_without_llm(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -102,7 +204,7 @@ class WorkflowResumeTest(unittest.TestCase):
                 SETTINGS,
                 workflow_artifact_dir=directory,
                 workflow_llm_candidate_limit=1,
-                llm_max_calls_per_run=7,
+                llm_max_calls_per_run=13,
             )
             workflow = DailyWorkflow(settings, ROOT)
             run_id = "workflow-resume-regression"
@@ -145,7 +247,7 @@ class WorkflowResumeTest(unittest.TestCase):
             self.assertFalse(result["paper"]["mutated"])
             completed = json.loads(state_path.read_text(encoding="utf-8"))
             self.assertEqual(completed["status"], "COMPLETE")
-            self.assertIn(f"research.{symbol}.trader", completed["completed_nodes"])
+            self.assertIn(f"research.{symbol}.portfolio_manager", completed["completed_nodes"])
 
     def test_account_lock_paths_are_isolated_and_sanitized(self):
         base = Path("artifacts/paper_scheduler.lock")

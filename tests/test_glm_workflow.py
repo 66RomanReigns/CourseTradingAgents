@@ -44,7 +44,22 @@ class FakeCompletions:
             }
         )
         message = SimpleNamespace(content=content)
-        return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+        usage = SimpleNamespace(
+            prompt_tokens=120,
+            completion_tokens=40,
+            total_tokens=160,
+        )
+        return SimpleNamespace(
+            id="glm-smoke-response",
+            model="glm-4.7-flash",
+            usage=usage,
+            choices=[
+                SimpleNamespace(
+                    message=message,
+                    finish_reason="stop",
+                )
+            ],
+        )
 
 
 class GlmProviderContractTest(unittest.TestCase):
@@ -52,6 +67,23 @@ class GlmProviderContractTest(unittest.TestCase):
         client = build_llm_client(SETTINGS, ROOT)
         self.assertEqual(client.identity, "dry-run:zhipu:glm-4.7-flash")
         self.assertIsInstance(client.delegate, DryRunLLMClient)
+
+    def test_explicit_quick_and_deep_models_keep_distinct_identities(self):
+        settings = replace(SETTINGS, llm_execution_mode="dry_run")
+        quick = build_llm_client(
+            settings,
+            ROOT,
+            model="quick-test-model",
+            cache_namespace="quick-test",
+        )
+        deep = build_llm_client(
+            settings,
+            ROOT,
+            model="deep-test-model",
+            cache_namespace="deep-test",
+        )
+        self.assertEqual(quick.identity, "dry-run:zhipu:quick-test-model")
+        self.assertEqual(deep.identity, "dry-run:zhipu:deep-test-model")
 
     def test_live_glm_requires_key_before_network_use(self):
         settings = replace(SETTINGS, llm_execution_mode="live")
@@ -88,6 +120,9 @@ class GlmProviderContractTest(unittest.TestCase):
             completions.request["extra_body"],
             {"thinking": {"type": "disabled"}},
         )
+        self.assertEqual(client.last_metadata["total_tokens"], 160)
+        self.assertEqual(client.last_metadata["finish_reason"], "stop")
+        self.assertEqual(client.last_metadata["response_id"], "glm-smoke-response")
 
 
 class WorkflowSafetyTest(unittest.TestCase):
@@ -107,15 +142,25 @@ class WorkflowSafetyTest(unittest.TestCase):
             self.assertFalse(result["plan"]["external_requests_enabled"])
             self.assertEqual(
                 result["research"]["result"]["planned_calls"],
-                14,
+                29,
             )
             self.assertFalse(result["paper"]["mutated"])
             self.assertTrue(Path(result["artifact"]).is_file())
             identities = {
-                row["client"]
+                identity
                 for row in result["research"]["result"]["candidates"].values()
+                for identity in row["clients"].values()
             }
             self.assertEqual(identities, {"dry-run:zhipu:glm-4.7-flash"})
+            candidate = next(iter(result["research"]["result"]["candidates"].values()))
+            self.assertEqual(len(candidate["result"]["risk_reviews"]), 3)
+            self.assertEqual(len(candidate["result"]["debate_rounds"]), 2)
+            graph = next(
+                step
+                for step in result["plan"]["steps"]
+                if step["name"] == "structured_research"
+            )["graph"]
+            self.assertEqual(len(graph), 13)
 
     def test_live_workflow_requires_explicit_confirmation(self):
         workflow = DailyWorkflow(SETTINGS, ROOT)
@@ -125,7 +170,7 @@ class WorkflowSafetyTest(unittest.TestCase):
     def test_call_budget_is_enforced_before_execution(self):
         settings = replace(
             SETTINGS,
-            llm_max_calls_per_run=7,
+            llm_max_calls_per_run=21,
             workflow_llm_candidate_limit=2,
         )
         with self.assertRaisesRegex(ValueError, "exceed"):

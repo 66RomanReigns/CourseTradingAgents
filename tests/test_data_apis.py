@@ -1,3 +1,4 @@
+import gzip
 import json
 import tempfile
 import unittest
@@ -84,6 +85,8 @@ class TwelveDataTest(unittest.TestCase):
         self.assertEqual(bars[0].timestamp.hour, 16)
         self.assertEqual(bars[0].available_at, bars[0].timestamp)
         self.assertEqual(http.calls[0]["params"]["order"], "ASC")
+        self.assertNotIn("apikey", http.calls[0]["params"])
+        self.assertEqual(http.calls[0]["headers"]["Authorization"], "apikey x")
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "spy.csv"
             self.assertEqual(write_bars_csv(bars, path), 2)
@@ -92,6 +95,55 @@ class TwelveDataTest(unittest.TestCase):
 
 
 class AlphaVantageTest(unittest.TestCase):
+    def test_daily_market_fallback_uses_exchange_sessions(self):
+        http = RouteHttp(
+            {
+                AlphaVantageNewsClient.BASE_URL: {
+                    "Meta Data": {"2. Symbol": "SPY"},
+                    "Time Series (Daily)": {
+                        "2025-11-28": {
+                            "1. open": "680.0",
+                            "2. high": "682.0",
+                            "3. low": "678.0",
+                            "4. close": "681.0",
+                            "5. volume": "1000000",
+                        }
+                    },
+                }
+            }
+        )
+        bars = AlphaVantageNewsClient(
+            api_key="x",
+            http=http,
+        ).fetch_daily_bars("SPY")
+        self.assertEqual(len(bars), 1)
+        self.assertEqual(bars[0].open_at, datetime(2025, 11, 28, 9, 30))
+        self.assertEqual(bars[0].timestamp, datetime(2025, 11, 28, 13, 0))
+        self.assertEqual(http.calls[0]["params"]["function"], "TIME_SERIES_DAILY")
+        self.assertEqual(http.calls[0]["params"]["apikey"], "x")
+
+    def test_daily_market_fallback_rejects_holiday_rows(self):
+        http = RouteHttp(
+            {
+                AlphaVantageNewsClient.BASE_URL: {
+                    "Time Series (Daily)": {
+                        "2025-12-25": {
+                            "1. open": "1",
+                            "2. high": "1",
+                            "3. low": "1",
+                            "4. close": "1",
+                            "5. volume": "1",
+                        }
+                    }
+                }
+            }
+        )
+        with self.assertRaisesRegex(DataApiError, "trading session"):
+            AlphaVantageNewsClient(
+                api_key="x",
+                http=http,
+            ).fetch_daily_bars("SPY")
+
     def test_news_is_converted_to_point_in_time_jsonl(self):
         http = RouteHttp(
             {
@@ -264,8 +316,9 @@ class ExternalEvidenceBacktestTest(unittest.TestCase):
 
 
 class _FakeResponse:
-    def __init__(self, payload: bytes):
+    def __init__(self, payload: bytes, headers=None):
         self.payload = payload
+        self.headers = dict(headers or {})
 
     def __enter__(self):
         return self
@@ -283,6 +336,26 @@ class HttpClientSafetyTest(unittest.TestCase):
         self.assertNotIn("secret", redacted)
         self.assertIn("apikey=%2A%2A%2A", redacted)
         self.assertIn("symbol=SPY", redacted)
+
+    def test_gzip_json_is_decoded_before_validation_and_cache(self):
+        with tempfile.TemporaryDirectory() as temp:
+            client = CachedHttpJsonClient(
+                cache_dir=Path(temp),
+                max_retries=0,
+                max_response_bytes=1024,
+            )
+            payload = gzip.compress(b'{"value": 42}')
+            with patch(
+                "tradinglab_agents.data.http_client.urlopen",
+                return_value=_FakeResponse(
+                    payload,
+                    headers={"content-encoding": "gzip"},
+                ),
+            ):
+                self.assertEqual(
+                    client.get_json("https://example.test/data"),
+                    {"value": 42},
+                )
 
     def test_response_size_limit_is_enforced(self):
         with tempfile.TemporaryDirectory() as temp:

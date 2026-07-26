@@ -18,7 +18,7 @@ set -a
 source "$KEYS_FILE"
 set +a
 
-required=(TWELVE_DATA_API_KEY ALPHA_VANTAGE_API_KEY FRED_API_KEY GOOGLE_API_KEY ZHIPU_API_KEY TRADINGLAB_API_TOKEN)
+required=(TWELVE_DATA_API_KEY ALPHA_VANTAGE_API_KEY FRED_API_KEY SEC_USER_AGENT GOOGLE_API_KEY ZHIPU_API_KEY TRADINGLAB_API_TOKEN)
 for name in "${required[@]}"; do
   if [[ -z "${!name:-}" ]]; then
     echo "error: missing $name in $KEYS_FILE" >&2

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import time
+import zlib
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -43,6 +45,35 @@ def _redact_url(url: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(redacted), parts.fragment))
 
 
+def _decode_content(
+    payload: bytes,
+    headers: Mapping[str, str],
+    source: str,
+    max_response_bytes: int,
+) -> bytes:
+    normalized_headers = {str(key).lower(): str(value) for key, value in headers.items()}
+    encoding = normalized_headers.get("content-encoding", "").lower().strip()
+    try:
+        if encoding == "gzip":
+            decoded = gzip.decompress(payload)
+        elif encoding == "deflate":
+            try:
+                decoded = zlib.decompress(payload)
+            except zlib.error:
+                decoded = zlib.decompress(payload, -zlib.MAX_WBITS)
+        else:
+            decoded = payload
+    except (OSError, zlib.error) as exc:
+        raise DataApiError(
+            f"invalid {encoding or 'identity'} response encoding from {_redact_url(source)}: {exc}"
+        ) from exc
+    if len(decoded) > max_response_bytes:
+        raise DataApiError(
+            f"decoded response from {_redact_url(source)} exceeds {max_response_bytes} bytes"
+        )
+    return decoded
+
+
 def _json_object(payload: bytes, source: str) -> dict[str, Any]:
     try:
         value = json.loads(payload.decode("utf-8"))
@@ -81,11 +112,17 @@ class CachedHttpJsonClient:
         return f"{url}{separator}{query}"
 
     def _cache_path(self, request_url: str, headers: Mapping[str, str]) -> Path:
+        authorization = headers.get("Authorization", "")
         identity = json.dumps(
             {
                 "url": request_url,
                 "accept": headers.get("Accept", "application/json"),
                 "user_agent": headers.get("User-Agent", self.default_user_agent),
+                "authorization_sha256": (
+                    hashlib.sha256(authorization.encode("utf-8")).hexdigest()
+                    if authorization
+                    else None
+                ),
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -143,11 +180,20 @@ class CachedHttpJsonClient:
                 request = Request(request_url, headers=request_headers, method="GET")
                 with urlopen(request, timeout=self.timeout_seconds) as response:
                     payload = response.read(self.max_response_bytes + 1)
+                    response_headers = {
+                        str(key): str(value) for key, value in response.headers.items()
+                    }
                 if len(payload) > self.max_response_bytes:
                     raise DataApiError(
                         f"response from {_redact_url(request_url)} exceeds "
                         f"{self.max_response_bytes} bytes"
                     )
+                payload = _decode_content(
+                    payload,
+                    response_headers,
+                    request_url,
+                    self.max_response_bytes,
+                )
                 result = _json_object(payload, request_url)
                 cache_path.parent.mkdir(parents=True, exist_ok=True)
                 temporary = cache_path.with_suffix(".tmp")

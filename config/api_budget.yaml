@@ -27,14 +27,17 @@ providers:
     application_budget:
       scheduled_runs_per_day: 1
       symbols_per_run: 5
-      expected_requests_per_run: 5
-      maximum_requests_per_day: 10
-      reserve_requests_per_day: 15
+      expected_news_requests_per_run: 5
+      maximum_market_fallback_requests_per_run: 5
+      maximum_requests_per_run: 10
+      maximum_requests_per_day: 15
+      reserve_requests_per_day: 10
     schedule:
       weekdays_only: true
       local_time: "17:25"
+      shared_minimum_interval_seconds: 15.0
     cache_ttl_seconds: 21600
-    policy: "One NEWS_SENTIMENT request per symbol after market close; reuse cached news during all agent runs."
+    policy: "Use NEWS_SENTIMENT as the normal five-request workload and TIME_SERIES_DAILY only as a Twelve Data fallback or explicit shadow check; market and news share one 15-second pacing group."
 
   fred:
     documented_limits:
@@ -51,18 +54,20 @@ providers:
     policy: "Refresh only configured macro series; use one-second spacing and retain point-in-time vintages."
 
   zhipu:
-    selected_model: glm-4.7-flash
+    quick_model: glm-4.7-flash
+    deep_model: glm-4.7-flash
     official_status: "Free model"
     endpoint: "https://open.bigmodel.cn/api/paas/v4"
     application_budget:
-      maximum_requests_per_workflow: 14
+      maximum_requests_per_workflow: 29
       candidate_symbols_per_workflow: 2
-      requests_per_candidate: 7
+      requests_per_candidate: 13
+      portfolio_supervisor_requests: 3
     execution_policy:
       default_mode: dry_run
       live_requires_explicit_confirmation: true
       thinking_mode: disabled
-    policy: "Run quant screening for the full universe, then use the structured seven-call research chain only for the top two candidates."
+    policy: "Run quant screening for the full universe, use the tiered 13-call research graph for the top two candidates, then run one three-call cross-asset portfolio supervisor graph."
 
   gemini:
     identification: "AQ-prefixed key is treated as a likely Gemini authorization key, pending local validation."
@@ -79,7 +84,8 @@ providers:
 
 operational_rules:
   - "All provider responses must be cached before strategy or agent execution."
-  - "A 429 response stops that provider's refresh for the current cycle; do not retry aggressively."
+  - "The default failure policy is fail_closed; last-known-good data must be explicitly enabled and labelled DEGRADED_STALE."
+  - "A 429 response places that provider and data kind into a persisted cooldown; the Provider Graph routes to the next eligible source without aggressive retry."
   - "No provider key may appear in URLs, logs, reports, SQLite rows or Git-tracked files."
-  - "Alpha Vantage is the binding daily quota and determines the five-symbol universe size."
+  - "Alpha Vantage is the binding daily data quota: five news calls are expected and up to five market fallback calls are reserved."
   - "Backtests and tests remain offline and never consume external API quota."

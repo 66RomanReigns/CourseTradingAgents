@@ -10,10 +10,15 @@ from typing import Any
 
 from tradinglab_agents.broker.paper import PaperBroker
 from tradinglab_agents.config import BacktestSettings
+from tradinglab_agents.data.corporate_actions import LocalCorporateActionProvider
 from tradinglab_agents.data.csv_provider import LocalCsvProvider
 from tradinglab_agents.data.evidence_provider import LocalPointInTimeEvidenceProvider
 from tradinglab_agents.data.news_provider import LocalNewsProvider
+from tradinglab_agents.engine.decision_graph import (
+    LangGraphDeterministicDecisionRuntime,
+)
 from tradinglab_agents.engine.market import AlignedMarketData
+from tradinglab_agents.engine.trading_calendar import ExchangeTradingCalendar
 from tradinglab_agents.engine.portfolio_planner import PortfolioPlan, PortfolioPlanner
 from tradinglab_agents.models import Fill, Portfolio
 from tradinglab_agents.paper.models import (
@@ -52,8 +57,17 @@ class PaperTradingService:
         )
         self.planner = PortfolioPlanner(self.settings)
 
-    @staticmethod
+    def _runtime_path(self, value: str | Path) -> Path:
+        path = Path(value)
+        if path.is_absolute():
+            return path
+        parts = path.parts
+        if parts and parts[0] == "artifacts":
+            return self.store.path.parent.joinpath(*parts[1:])
+        return self.store.path.parent / path
+
     def load_market(
+        self,
         data_dir: str | Path,
         symbols: Sequence[str],
     ) -> tuple[
@@ -68,6 +82,8 @@ class PaperTradingService:
             raise ValueError("paper multi-asset account requires at least two symbols")
         providers: dict[str, LocalCsvProvider] = {}
         news: dict[str, LocalNewsProvider] = {}
+        calendar = ExchangeTradingCalendar(self.settings.market_calendar_name)
+        corporate_actions: dict[str, LocalCorporateActionProvider] = {}
         for symbol in normalized:
             price_path = root / f"{symbol}.csv"
             if not price_path.is_file():
@@ -76,7 +92,31 @@ class PaperTradingService:
             news_path = root / f"{symbol}_news.jsonl"
             if news_path.is_file():
                 news[symbol] = LocalNewsProvider(news_path)
-        return AlignedMarketData(providers), news
+            action_path = root / f"{symbol}{self.settings.market_corporate_action_suffix}"
+            if self.settings.market_corporate_actions_enabled and action_path.is_file():
+                corporate_actions[symbol] = LocalCorporateActionProvider(
+                    action_path,
+                    symbol,
+                    calendar=calendar,
+                )
+        return (
+            AlignedMarketData(
+                providers,
+                calendar=(calendar if self.settings.market_strict_sessions else None),
+                strict_session_times=self.settings.market_strict_session_times,
+                require_complete_alignment=(
+                    self.settings.market_require_complete_alignment
+                ),
+                corporate_actions=corporate_actions,
+                adjust_history_for_splits=(
+                    self.settings.market_adjust_history_for_splits
+                ),
+                adjust_history_for_dividends=(
+                    self.settings.market_adjust_history_for_dividends
+                ),
+            ),
+            news,
+        )
 
     def initialize_account(
         self,
@@ -166,6 +206,10 @@ class PaperTradingService:
             "recent_fills": [asdict(fill) for fill in self.store.list_fills(account_id, 20)],
             "equity_history": self.store.equity_history(account_id, 30),
             "recent_decision_memories": self.store.list_decision_memories(
+                account_id,
+                limit=20,
+            ),
+            "recent_corporate_actions": self.store.list_corporate_action_events(
                 account_id,
                 limit=20,
             ),
@@ -378,8 +422,36 @@ class PaperTradingService:
                 if action == "BUY"
                 else (-raw_return if action == "SELL" else -abs(alpha_return))
             )
+            rationale = dict(memory.get("rationale") or {})
+            trace = dict(rationale.get("research_trace") or {})
+            preliminary = dict(trace.get("preliminary_trader") or {})
+            portfolio_manager = dict(trace.get("portfolio_manager") or {})
+            reviews = [
+                dict(item)
+                for item in trace.get("risk_reviews", [])
+                if isinstance(item, Mapping)
+            ]
+            preliminary_action = str(preliminary.get("action") or "UNKNOWN")
+            portfolio_action = str(portfolio_manager.get("action") or "UNKNOWN")
+            verdicts = [str(item.get("verdict") or "UNKNOWN") for item in reviews]
+            research_attribution = {
+                "present": bool(trace),
+                "graph_version": trace.get("graph_version"),
+                "debate_rounds": len(trace.get("debate_rounds", [])),
+                "preliminary_action": preliminary_action,
+                "portfolio_manager_action": portfolio_action,
+                "decision_changed_by_committee": (
+                    bool(trace)
+                    and preliminary_action != "UNKNOWN"
+                    and portfolio_action != preliminary_action
+                ),
+                "risk_verdicts": verdicts,
+                "veto_count": verdicts.count("VETO"),
+                "reduce_count": verdicts.count("REDUCE"),
+                "model_clients": dict(trace.get("clients") or {}),
+            }
             reflection = {
-                "generator": "deterministic_outcome_attribution_v1",
+                "generator": "deterministic_outcome_attribution_v2",
                 "llm_generated": False,
                 "action": action,
                 "directional_score": directional_score,
@@ -388,6 +460,7 @@ class PaperTradingService:
                     if failure_type is None
                     else f"review decision pattern: {failure_type}"
                 ),
+                "research_attribution": research_attribution,
                 "source_memory_immutable": True,
             }
             matured += int(
@@ -418,15 +491,42 @@ class PaperTradingService:
         next_timestamp = market.next_timestamp(timestamp)
         if next_timestamp is None:
             return None, []
-        plan = self.planner.plan(
-            market,
-            timestamp,
-            portfolio,
-            news_providers=news_providers,
-            evidence_providers=evidence_providers,
-            strategy_state=account.strategy_state,
-            research_overlays=research_overlays,
-        )
+        if self.settings.workflow_decision_graph_enabled:
+            context = self.planner.prepare_context(
+                market,
+                timestamp,
+                portfolio,
+                news_providers=news_providers,
+                evidence_providers=evidence_providers,
+                strategy_state=account.strategy_state,
+                research_overlays=research_overlays,
+            )
+            runtime = LangGraphDeterministicDecisionRuntime(
+                self.planner,
+                event_path=self._runtime_path(
+                    self.settings.workflow_langgraph_event_path
+                ),
+            )
+            execution = runtime.run(
+                thread_id=f"{run.run_id}:DECISION",
+                context=context,
+                audit_runner=lambda _name, function: function(),
+                checkpointer_path=self._runtime_path(
+                    self.settings.workflow_decision_checkpoint_database
+                ),
+                resume=True,
+            )
+            plan = execution.plan
+        else:
+            plan = self.planner.plan(
+                market,
+                timestamp,
+                portfolio,
+                news_providers=news_providers,
+                evidence_providers=evidence_providers,
+                strategy_state=account.strategy_state,
+                research_overlays=research_overlays,
+            )
         close_snapshot = market.close_snapshot(timestamp)
         current = portfolio.weights(close_snapshot, set(market.symbols))
         scheduled_for = market.open_snapshot(next_timestamp).timestamp
@@ -435,7 +535,13 @@ class PaperTradingService:
             run_id=run.run_id,
             decision_time=plan.decision_time,
             market_timestamp=plan.market_timestamp,
-            symbol_decisions=plan.symbol_decisions,
+            symbol_decisions={
+                symbol: {
+                    **dict(decision),
+                    "decision_graph": dict(plan.graph_runtime),
+                }
+                for symbol, decision in plan.symbol_decisions.items()
+            },
             approved_targets=plan.target_weights,
             benchmark_symbol=("SPY" if "SPY" in market.symbols else market.symbols[0]),
         )
@@ -555,6 +661,16 @@ class PaperTradingService:
             run = self.store.get_daily_run(account_id, session_key) or run
 
         try:
+            session_actions = market.actions_for_session(
+                session_key,
+                as_of=open_snapshot.timestamp,
+            )
+            corporate_action_events = self.store.apply_corporate_action_events(
+                account_id=account_id,
+                run_id=run.run_id,
+                actions=session_actions,
+                reference_prices=open_snapshot.prices,
+            )
             account = self.store.require_account(account_id)
             portfolio = self._portfolio(account)
             open_fills, orders_executed = self._execute_open(
@@ -602,6 +718,16 @@ class PaperTradingService:
                 "session_date": session_key,
                 "open_at": open_snapshot.timestamp.isoformat(),
                 "close_at": close_snapshot.timestamp.isoformat(),
+                "market_session": {
+                    "calendar": self.settings.market_calendar_name,
+                    "session_date": session_key,
+                    "open_at": open_snapshot.timestamp.isoformat(),
+                    "close_at": close_snapshot.timestamp.isoformat(),
+                    "is_early_close": (
+                        close_snapshot.timestamp.hour < 16
+                    ),
+                },
+                "corporate_action_events": corporate_action_events,
                 "open_fills": open_fills,
                 "orders_executed": orders_executed,
                 "orders_created": len(created_orders),
@@ -620,6 +746,7 @@ class PaperTradingService:
                         "risk_state": plan.risk_decision.state,
                         "force_execution": plan.risk_decision.force_execution,
                         "symbol_decisions": plan.symbol_decisions,
+                        "graph_runtime": plan.graph_runtime,
                     }
                     if plan is not None
                     else None

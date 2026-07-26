@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import os
-from datetime import date, datetime, time
+from datetime import date, datetime
 from typing import Any
 
 from tradinglab_agents.data.http_client import CachedHttpJsonClient, DataApiError, JsonHttpClient
+from tradinglab_agents.engine.trading_calendar import ExchangeTradingCalendar
 from tradinglab_agents.models import Bar
 
 
@@ -39,6 +40,7 @@ class TwelveDataClient:
         timezone_name: str = "America/New_York",
         cache_ttl_seconds: int = 6 * 3600,
         force_refresh: bool = False,
+        calendar_name: str = "XNYS",
     ) -> list[Bar]:
         if outputsize <= 0:
             raise ValueError("outputsize must be positive")
@@ -48,7 +50,6 @@ class TwelveDataClient:
             "outputsize": min(outputsize, 5000),
             "order": "ASC",
             "timezone": timezone_name,
-            "apikey": self.api_key,
         }
         if start_date is not None:
             params["start_date"] = str(start_date)
@@ -57,6 +58,7 @@ class TwelveDataClient:
         payload = self.http.get_json(
             self.BASE_URL,
             params,
+            headers={"Authorization": f"apikey {self.api_key}"},
             cache_ttl_seconds=cache_ttl_seconds,
             force_refresh=force_refresh,
         )
@@ -66,14 +68,16 @@ class TwelveDataClient:
         values = payload.get("values")
         if not isinstance(values, list):
             raise DataApiError("Twelve Data values must be a list")
+        calendar = ExchangeTradingCalendar(calendar_name)
         bars: list[Bar] = []
         for row in values:
             if not isinstance(row, dict):
                 continue
             session_date = self._parse_session_date(str(row.get("datetime", "")))
-            open_at = datetime.combine(session_date, time(9, 30))
-            close_at = datetime.combine(session_date, time(16, 0))
             try:
+                session = calendar.session(session_date)
+                open_at = session.open_at
+                close_at = session.close_at
                 bars.append(
                     Bar(
                         symbol=symbol.upper(),
@@ -88,7 +92,9 @@ class TwelveDataClient:
                     )
                 )
             except (KeyError, TypeError, ValueError) as exc:
-                raise DataApiError(f"invalid Twelve Data bar for {session_date}: {exc}") from exc
+                raise DataApiError(
+                    f"invalid Twelve Data bar or exchange session for {session_date}: {exc}"
+                ) from exc
         bars.sort(key=lambda item: item.timestamp)
         if not bars:
             raise DataApiError(f"Twelve Data returned no daily bars for {symbol.upper()}")

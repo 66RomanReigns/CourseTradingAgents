@@ -5,6 +5,8 @@ llm:
   execution_mode: dry_run
   provider: zhipu
   model: glm-4.7-flash
+  quick_model: glm-4.7-flash
+  deep_model: glm-4.7-flash
   temperature: 0.0
   thinking_mode: disabled
   api_key_env: ZHIPU_API_KEY
@@ -12,7 +14,7 @@ llm:
   timeout_seconds: 60
   cache_dir: artifacts/llm_cache
   log_path: artifacts/llm_calls.jsonl
-  max_calls_per_run: 14
+  max_calls_per_run: 29
 
 agents:
   context:
@@ -46,6 +48,16 @@ backtest:
   rebalance_threshold: 0.03
   cooldown_bars: 3
 
+market:
+  calendar: XNYS
+  strict_sessions: true
+  strict_session_times: true
+  require_complete_alignment: true
+  corporate_actions_enabled: true
+  corporate_action_suffix: _actions.jsonl
+  adjust_history_for_splits: true
+  adjust_history_for_dividends: true
+
 paper:
   database_path: artifacts/paper_trading.db
   data_dir: data/multi_sample
@@ -59,6 +71,19 @@ workflow:
   symbols: [SPY, QQQ, AAPL, MSFT, NVDA]
   live_data_dir: data/real
   artifact_dir: artifacts/workflows
+  network_preflight: true
+  connectivity_probe_url: http://connectivitycheck.gstatic.com/generate_204
+  provider_usage_database: artifacts/provider_usage.db
+  provider_graph_enabled: true
+  provider_health_database: artifacts/provider_health.db
+  provider_checkpoint_database: artifacts/langgraph/data_provider_checkpoints.db
+  provider_min_quality_score: 0.75
+  provider_block_quality_score: 0.45
+  provider_conflict_warn_relative_difference: 0.005
+  provider_conflict_block_relative_difference: 0.02
+  provider_shadow_validation_enabled: false
+  provider_failure_policy: fail_closed
+  stale_data_max_hours: 48
   refresh_market: true
   refresh_news: true
   refresh_macro: true
@@ -67,3 +92,26 @@ workflow:
   run_paper: true
   macro_series: [DGS10, CPIAUCSL, UNRATE]
   llm_candidate_limit: 2
+  debate_rounds: 2
+  risk_personas: [aggressive, balanced, conservative]
+  memory_feedback_enabled: true
+  memory_feedback_limit: 5
+  research_runtime: langgraph
+  langgraph_checkpoint_database: artifacts/langgraph/research_checkpoints.db
+  langchain_trace_path: artifacts/langchain_events.jsonl
+  langgraph_event_path: artifacts/langgraph_events.jsonl
+  langgraph_retry_attempts: 2
+  langgraph_node_timeout_seconds: 120
+  langgraph_cost_aware_routing: false
+  langgraph_hold_skip_confidence: 0.40
+  langgraph_human_review_mode: paper_queue
+  portfolio_supervisor_enabled: true
+  research_parent_graph_enabled: true
+  research_parent_checkpoint_database: artifacts/langgraph/research_parent_checkpoints.db
+  workflow_core_graph_enabled: true
+  workflow_core_checkpoint_database: artifacts/langgraph/workflow_core_checkpoints.db
+  decision_graph_enabled: true
+  decision_checkpoint_database: artifacts/langgraph/decision_checkpoints.db
+  portfolio_correlation_window: 60
+  portfolio_high_correlation_threshold: 0.80
+  portfolio_cluster_gross_cap: 0.25

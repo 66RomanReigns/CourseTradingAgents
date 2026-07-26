@@ -3,7 +3,12 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import date, datetime
 
+from tradinglab_agents.data.corporate_actions import (
+    CorporateAction,
+    LocalCorporateActionProvider,
+)
 from tradinglab_agents.data.csv_provider import LocalCsvProvider
+from tradinglab_agents.engine.trading_calendar import ExchangeTradingCalendar
 from tradinglab_agents.models import Bar, MarketSnapshot
 
 
@@ -15,7 +20,17 @@ class AlignedMarketData:
     allocation, risk or execution calculations.
     """
 
-    def __init__(self, providers: Mapping[str, LocalCsvProvider]):
+    def __init__(
+        self,
+        providers: Mapping[str, LocalCsvProvider],
+        *,
+        calendar: ExchangeTradingCalendar | None = None,
+        strict_session_times: bool = True,
+        require_complete_alignment: bool = False,
+        corporate_actions: Mapping[str, LocalCorporateActionProvider] | None = None,
+        adjust_history_for_splits: bool = True,
+        adjust_history_for_dividends: bool = True,
+    ):
         if len(providers) < 2:
             raise ValueError("multi-asset market data requires at least two providers")
         normalized: dict[str, LocalCsvProvider] = {}
@@ -31,9 +46,40 @@ class AlignedMarketData:
             normalized[symbol] = provider
             maps[symbol] = {bar.timestamp: bar for bar in provider.bars}
 
+        if calendar is not None:
+            for items in maps.values():
+                for bar in items.values():
+                    calendar.validate_bar(
+                        bar,
+                        strict_times=strict_session_times,
+                    )
         common = set.intersection(*(set(items) for items in maps.values()))
+        total_unique = set().union(*(set(items) for items in maps.values()))
+        dropped = total_unique.difference(common)
+        if require_complete_alignment and dropped:
+            sample = sorted(item.isoformat() for item in dropped)[:10]
+            raise ValueError(
+                "market providers have unmatched synchronized sessions: "
+                f"count={len(dropped)}, sample={sample}"
+            )
         self.providers = normalized
         self._maps = maps
+        self.calendar = calendar
+        self.strict_session_times = strict_session_times
+        self.require_complete_alignment = require_complete_alignment
+        self.adjust_history_for_splits = adjust_history_for_splits
+        self.adjust_history_for_dividends = adjust_history_for_dividends
+        action_map = {
+            symbol.upper(): provider
+            for symbol, provider in (corporate_actions or {}).items()
+        }
+        unknown_actions = set(action_map).difference(normalized)
+        if unknown_actions:
+            raise ValueError(
+                "corporate action providers contain unknown symbols: "
+                f"{sorted(unknown_actions)}"
+            )
+        self.corporate_actions = action_map
         self.timestamps = tuple(sorted(common))
         if len(self.timestamps) < 2:
             raise ValueError("providers do not share at least two synchronized timestamps")
@@ -91,8 +137,54 @@ class AlignedMarketData:
             field="open",
         )
 
-    def history(self, symbol: str, decision_time: datetime) -> list[Bar]:
+    def raw_history(self, symbol: str, decision_time: datetime) -> list[Bar]:
         return self.providers[symbol.upper()].history(decision_time)
+
+    def history(self, symbol: str, decision_time: datetime) -> list[Bar]:
+        normalized = symbol.upper()
+        bars = self.raw_history(normalized, decision_time)
+        provider = self.corporate_actions.get(normalized)
+        if provider is None:
+            return bars
+        return provider.adjust_history(
+            bars,
+            decision_time,
+            include_splits=self.adjust_history_for_splits,
+            include_cash_dividends=self.adjust_history_for_dividends,
+        )
+
+    def actions_for_session(
+        self,
+        session_date: date | str,
+        *,
+        as_of: datetime | None = None,
+    ) -> tuple[CorporateAction, ...]:
+        actions = [
+            action
+            for provider in self.corporate_actions.values()
+            for action in provider.actions_for_session(session_date, as_of=as_of)
+        ]
+        return tuple(sorted(actions, key=lambda item: (item.symbol, item.action_id)))
+
+    def market_semantics(self) -> dict[str, object]:
+        start = self.timestamps[0].date()
+        end = self.timestamps[-1].date()
+        calendar_summary = (
+            self.calendar.summary(start, end) if self.calendar is not None else None
+        )
+        return {
+            "calendar": calendar_summary,
+            "strict_session_times": self.strict_session_times,
+            "require_complete_alignment": self.require_complete_alignment,
+            "adjust_history_for_splits": self.adjust_history_for_splits,
+            "adjust_history_for_dividends": (
+                self.adjust_history_for_dividends
+            ),
+            "corporate_actions": {
+                symbol: provider.summary()
+                for symbol, provider in sorted(self.corporate_actions.items())
+            },
+        }
 
     def index_of(self, timestamp: datetime) -> int:
         try:

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import csv
-from datetime import date, datetime, time
+from datetime import date, datetime
 from pathlib import Path
+
+from tradinglab_agents.engine.trading_calendar import ExchangeTradingCalendar
 
 
 def parse_day(value: str) -> date:
@@ -16,7 +18,13 @@ def parse_day(value: str) -> date:
     raise ValueError(f"unsupported date value: {value!r}")
 
 
-def normalize(input_path: Path, output_path: Path) -> int:
+def normalize(
+    input_path: Path,
+    output_path: Path,
+    *,
+    calendar_name: str = "XNYS",
+) -> int:
+    calendar = ExchangeTradingCalendar(calendar_name)
     with input_path.open(newline="", encoding="utf-8-sig") as source:
         reader = csv.DictReader(source)
         field_lookup = {name.lower().replace(" ", "_"): name for name in reader.fieldnames or []}
@@ -33,8 +41,9 @@ def normalize(input_path: Path, output_path: Path) -> int:
         rows = []
         for raw in reader:
             day = parse_day(raw[date_key])
-            open_at = datetime.combine(day, time(9, 30))
-            close_at = datetime.combine(day, time(16, 0))
+            session = calendar.session(day)
+            open_at = session.open_at
+            close_at = session.close_at
             rows.append(
                 {
                     "timestamp": close_at.isoformat(),
@@ -66,8 +75,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Normalize common Yahoo-style OHLCV CSV")
     parser.add_argument("--input", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--calendar", default="XNYS")
     args = parser.parse_args()
-    count = normalize(args.input, args.output)
+    count = normalize(args.input, args.output, calendar_name=args.calendar)
     print(f"normalized_rows={count} output={args.output}")
 
 

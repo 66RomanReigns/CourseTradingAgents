@@ -1,7 +1,7 @@
 # API 密钥保存与免费额度规划
 
-版本：v0.9.0  
-日期：2026-07-20
+版本：v0.18.0
+日期：2026-07-26
 
 ## 1. 密钥保存方案
 
@@ -32,7 +32,7 @@ scripts/with_api_keys.sh make doctor
 scripts/with_api_keys.sh env PYTHONPATH=src .venv/bin/python -m tradinglab_agents.cli fetch-market ...
 ```
 
-当前服务器已由用户在该外部文件中配置 provider key；系统只验证文件存在、权限为 `600` 和变量非空，不输出值。v0.9.0 另通过 `make secrets-token` 生成 `TRADINGLAB_API_TOKEN`，用于保护所有非公共 FastAPI 接口。
+当前服务器已由用户在该外部文件中配置 provider key；系统只验证文件存在、权限为 `600` 和变量非空，不输出值。系统另通过 `make secrets-token` 生成 `TRADINGLAB_API_TOKEN`，用于保护所有非公共 FastAPI 接口。v0.18.0 会在发送任何 provider key 前执行无凭据联网检查，并在 DATA_PROVIDER Graph 内执行共享额度、健康状态和冷却时间预检，识别校园网门户、TLS 拦截和离线状态。
 
 所有在聊天消息中出现过的密钥都应视为已暴露。正式联调前应在 Twelve Data、Alpha Vantage、FRED、Google 和智谱控制台撤销旧密钥、重新生成，再通过静默安装器输入新值。
 
@@ -42,7 +42,7 @@ scripts/with_api_keys.sh env PYTHONPATH=src .venv/bin/python -m tradinglab_agent
 SPY, QQQ, AAPL, MSFT, NVDA
 ```
 
-所有外部数据先落盘并缓存，策略、回测和智能体只读本地文件。测试和回测默认离线，外部调用次数为零。
+所有外部数据先经过 `<run-id>:DATA_PROVIDER` 路由、质量门控，再落盘供策略和智能体读取。测试和回测默认离线，外部调用次数为零。调用状态和额度单位写入 `artifacts/provider_usage.db`，健康、冷却和冲突事件写入 `artifacts/provider_health.db`；两者均不保存密钥、Prompt、完整响应或原始模型输出。
 
 ## 3. Twelve Data
 
@@ -79,14 +79,16 @@ SPY, QQQ, AAPL, MSFT, NVDA
 项目规划：
 
 - 每个工作日美东时间 17:25 更新；
-- 每个标的一次 `NEWS_SENTIMENT`，共 5 次；
-- 请求之间至少间隔 15 秒，兼容旧的分钟频率限制；
-- 每日预计占用 5/25；
-- 应用层每日硬上限 10 次，保留至少 15 次人工调试余量；
-- 新闻缓存至少 6 小时；
-- 回测和多智能体重复运行只读同一份新闻缓存。
+- 正常负载为每个标的一次 `NEWS_SENTIMENT`，共 5 次；
+- 当 Twelve Data 日线失败时，Provider Graph 可按标的调用 `TIME_SERIES_DAILY`，最坏再增加 5 次；
+- 行情备用和新闻共享 `alpha_vantage` 节流组，全局串行且请求起点至少间隔 15 秒；
+- 单次工作流最坏使用 10/25；
+- 应用层每日硬上限 15 次，保留至少 10 次人工调试或恢复余量；
+- 达到应用上限时，在读取或发送 API Key 前直接跳过外部 fetcher，记录零单位 `RATE_LIMITED` 事件，并回退到本地缓存；
+- 新闻缓存至少 6 小时，行情缓存以最后一条 Bar 的 `available_at` 判断新鲜度；
+- 回测和多智能体重复运行只读同一份本地点时数据。
 
-Alpha Vantage 是当前方案的主要瓶颈。若标的增加到 10 个，仍可每天刷新一次；若增加到 20 个，几乎没有重试和人工调试余量，应先实现最多五标的批量新闻请求，或降低刷新频率。
+Alpha Vantage 是当前方案的主要瓶颈。五标的范围为新闻和行情备用预留了完整空间；扩大标的池前应先完成批量接口评估或降低新闻刷新频率。
 
 ## 5. FRED
 
@@ -117,7 +119,8 @@ https://open.bigmodel.cn/api/paas/v4
 - 模型设为 `glm-4.7-flash`；
 - 默认 `execution_mode: dry_run`，不会读取密钥或发送请求；
 - 全五标先做本地 Quant 筛选，只研究 Top-2；
-- 每个候选执行七个结构化角色调用，单工作流最多 14 次；
+- 每个候选执行 13 个结构化节点：三分析师、两轮多空辩论、研究经理、初步交易员、三类风险委员和最终组合经理；
+- Top-2 单标的研究为 26 次，之后增加相关性审查、集中度审查和 Portfolio Supervisor 共 3 次，标准工作流最多 29 次结构化调用；
 - live 模式必须显式 `--confirm-live`；
 - 默认关闭 thinking，以减少延迟和输出不确定性；
 - 模型只能作为保守覆盖层，不能绕过组合风控、人工审批或直接提交订单。
@@ -153,12 +156,12 @@ Gemini 免费层特点：
 ## 8. 推荐日程
 
 ```text
-17:10 ET  Twelve Data：5 个日线请求
-17:25 ET  Alpha Vantage：5 个新闻请求，每次间隔至少 15 秒
+17:10 ET  Provider Graph：Twelve Data 五标日线；失败标的按需走 Alpha Vantage
+17:25 ET  Alpha Vantage：五个新闻请求，与行情备用共享 15 秒节流组
 18:00 ET  FRED：最多 8 个序列，每次间隔至少 1 秒
-18:15 ET  数据完整性和时间戳审计
+18:15 ET  Conflict Resolver、Data Quality Gate 与本地数据审计
 18:20 ET  全标的 Quant 筛选
-18:22 ET  GLM-4.7-Flash：Top-2 × 7，最多 14 次，默认 dry-run
+18:22 ET  GLM：Top-2 × 13 + 3 次组合监督，最多 29 次，默认 dry-run
 18:30 ET  持久模拟盘收盘决策与审批队列
 按需       Gemini：最多 2 次组合级摘要/复核，默认关闭
 ```
@@ -191,7 +194,7 @@ make api-budget
 Twelve Data: 5/800 daily credits, 5/8 scheduled-minute credits
 Alpha Vantage: 5/25 daily requests
 FRED: up to 8 series, 1-second spacing
-Zhipu: glm-4.7-flash, maximum 14 requests/workflow, default dry_run
+Zhipu: configurable quick/deep models, maximum 29 requests/workflow, default dry_run
 Gemini: disabled, app cap 10 requests/day
 ```
 
@@ -218,3 +221,20 @@ Gemini: disabled, app cap 10 requests/day
 - 智谱 GLM-4.7-Flash、模型概览与 HTTP API 快速开始。
 
 供应商可能调整额度，正式长期运行时应每月复核一次，并以账户控制台显示的当前额度为最终依据。
+
+
+## 11. v0.18 Provider Graph 额度与安全边界
+
+Provider Capability Registry 为每个来源声明 `rate_limit_group`、`min_interval_seconds`、`max_concurrency` 和 `application_daily_quota`。路由器在调用前按美东自然日查询调用账本，并将同一进程内尚未完成的请求作为预留额度计算，避免并行分支同时穿透上限。
+
+```text
+Twelve Data：daily quota 20 units，最大并发 8
+Alpha Vantage：行情与新闻共享 daily quota 15 units、15 秒间隔、并发 1
+FRED：daily quota 8 units、1 秒间隔、并发 1
+SEC EDGAR：daily quota 20 units、0.12 秒间隔、并发 1
+本地缓存：0 units，不读取凭据
+```
+
+外部请求失败或额度不足时，Fallback 只允许降低风险。`DEGRADED` 数据会把所有新增 BUY 转为 HOLD；`BLOCKED` 数据不会写入正式文件，也不会进入 Research。Provider 注册表、质量阈值和请求清单共同进入 DATA_PROVIDER 输入 SHA-256，修改策略后不能复用旧 checkpoint。
+
+本版本只完成了真实客户端适配契约和离线故障注入，尚未使用当前服务器密钥完成 Twelve Data、Alpha Vantage、FRED、SEC EDGAR 或 GLM 的正式 smoke test。首次真实联调必须逐个 Provider 执行最小请求，并核对控制台和响应头中的实际额度规则。

@@ -16,6 +16,7 @@ from tradinglab_agents.agents.schemas import (
     MacroAnalysis,
     NewsAnalysis,
     ResearchDecision,
+    RiskReview,
     TradePlan,
 )
 
@@ -265,6 +266,196 @@ class MockLLM:
                 ),
                 "requires_human_approval": True,
             }
+        elif task == "risk_review":
+            persona = str(payload.get("persona", "balanced"))
+            plan = dict(payload.get("preliminary_trade", {}))
+            action = str(plan.get("action", "HOLD"))
+            confidence = float(plan.get("confidence", 0.0))
+            proposed = float(plan.get("target_weight", 0.0))
+            if action == "SELL":
+                verdict, cap = "APPROVE", 0.0
+            elif action == "HOLD":
+                verdict, cap = "APPROVE", proposed
+            elif persona == "conservative" and confidence < 0.65:
+                verdict, cap = "VETO", 0.0
+            elif persona == "balanced" and (confidence < 0.55 or proposed > 0.15):
+                verdict, cap = "REDUCE", min(proposed, 0.10)
+            elif persona == "aggressive" and confidence >= 0.45:
+                verdict, cap = "APPROVE", proposed
+            else:
+                verdict, cap = "REDUCE", min(proposed, 0.15)
+            raw = {
+                "persona": persona,
+                "verdict": verdict,
+                "confidence": min(0.95, max(0.35, confidence)),
+                "max_target_weight": cap,
+                "rationale": f"deterministic {persona} risk review of {action}",
+                "evidence_ids": tuple(str(item) for item in plan.get("evidence_ids", [])),
+                "conditions": ("paper trading only", "human approval required"),
+            }
+        elif task == "portfolio_manager":
+            plan = dict(payload.get("preliminary_trade", {}))
+            reviews = [dict(item) for item in payload.get("risk_reviews", [])]
+            action = str(plan.get("action", "HOLD"))
+            confidence = float(plan.get("confidence", 0.0))
+            target = float(plan.get("target_weight", 0.0))
+            caps = [float(item.get("max_target_weight", target)) for item in reviews]
+            cap = min([target, *caps]) if caps else target
+            veto = any(item.get("verdict") == "VETO" for item in reviews)
+            if action == "BUY" and veto:
+                action, target = "HOLD", 0.0
+            elif action == "BUY":
+                target = cap
+                if target <= 0.0:
+                    action = "HOLD"
+            elif action == "SELL":
+                target = 0.0
+            raw = {
+                "action": action,
+                "confidence": confidence,
+                "target_weight": target,
+                "order_type": "NO_ORDER" if action == "HOLD" else "MARKET_NEXT_OPEN",
+                "rationale": "portfolio manager reconciled trader intent with risk committee",
+                "evidence_ids": tuple(str(item) for item in plan.get("evidence_ids", [])),
+                "requires_human_approval": True,
+            }
+        elif task in {
+            "portfolio_correlation_review",
+            "portfolio_concentration_review",
+        }:
+            reviewer = (
+                "correlation"
+                if task == "portfolio_correlation_review"
+                else "concentration"
+            )
+            plans = [dict(item) for item in payload.get("candidate_plans", [])]
+            context = dict(payload.get("market_context", {}))
+            policy = dict(payload.get("policy", {}))
+            max_gross = float(policy.get("max_gross_target", 0.90))
+            cluster_cap = float(policy.get("high_correlation_cluster_cap", 0.25))
+            high_symbols = {
+                str(symbol).upper()
+                for pair in context.get("high_correlation_pairs", [])
+                for symbol in dict(pair).get("symbols", [])
+            }
+            high_symbol_cap = (
+                cluster_cap / len(high_symbols) if high_symbols else 0.20
+            )
+            caps = []
+            warnings = []
+            for plan in plans:
+                symbol = str(plan.get("symbol", "")).upper()
+                action = str(plan.get("action", "HOLD")).upper()
+                original = max(0.0, min(0.20, float(plan.get("target_weight", 0.0))))
+                if action == "SELL":
+                    cap = 0.0
+                elif reviewer == "correlation" and symbol in high_symbols:
+                    cap = min(original, high_symbol_cap)
+                    if cap < original:
+                        warnings.append(
+                            f"{symbol} reduced by deterministic high-correlation review"
+                        )
+                elif reviewer == "concentration" and original > 0.15:
+                    cap = 0.15
+                    warnings.append(
+                        f"{symbol} reduced by deterministic concentration review"
+                    )
+                else:
+                    cap = original
+                caps.append(
+                    {
+                        "symbol": symbol,
+                        "max_target_weight": cap,
+                        "rationale": (
+                            f"offline {reviewer} cap from original target {original:.4f}"
+                        ),
+                    }
+                )
+            raw = {
+                "reviewer": reviewer,
+                "confidence": 0.75,
+                "max_gross_target": min(
+                    max_gross,
+                    sum(float(item["max_target_weight"]) for item in caps),
+                ),
+                "symbol_caps": caps,
+                "rationale": f"offline deterministic {reviewer} portfolio review",
+                "warnings": tuple(warnings),
+            }
+        elif task == "portfolio_supervisor":
+            plans = [dict(item) for item in payload.get("candidate_plans", [])]
+            reviews = [dict(item) for item in payload.get("committee_reviews", [])]
+            policy = dict(payload.get("policy", {}))
+            max_gross = float(policy.get("max_gross_target", 0.90))
+            review_caps: dict[str, float] = {}
+            review_gross_caps = [max_gross]
+            for review in reviews:
+                review_gross_caps.append(
+                    float(review.get("max_gross_target", max_gross))
+                )
+                for cap in review.get("symbol_caps", []):
+                    item = dict(cap)
+                    symbol = str(item.get("symbol", "")).upper()
+                    value = float(item.get("max_target_weight", 0.0))
+                    review_caps[symbol] = min(
+                        review_caps.get(symbol, value),
+                        value,
+                    )
+            allocations = []
+            for plan in plans:
+                symbol = str(plan.get("symbol", "")).upper()
+                original_action = str(plan.get("action", "HOLD")).upper()
+                original_target = max(
+                    0.0,
+                    min(0.20, float(plan.get("target_weight", 0.0))),
+                )
+                target = min(
+                    original_target,
+                    review_caps.get(symbol, original_target),
+                )
+                if original_action == "SELL":
+                    action, target = "SELL", 0.0
+                elif original_action != "BUY" or target <= 1e-12:
+                    action = "HOLD"
+                else:
+                    action = "BUY"
+                allocations.append(
+                    {
+                        "symbol": symbol,
+                        "action": action,
+                        "target_weight": target,
+                        "confidence": float(plan.get("confidence", 0.0)),
+                        "rationale": (
+                            "offline portfolio supervisor reconciled per-symbol research "
+                            "with committee caps"
+                        ),
+                    }
+                )
+            gross = sum(float(item["target_weight"]) for item in allocations)
+            gross_cap = min(review_gross_caps)
+            if gross > gross_cap + 1e-12:
+                scale = gross_cap / gross
+                for item in allocations:
+                    item["target_weight"] = float(item["target_weight"]) * scale
+                    if item["action"] == "BUY" and item["target_weight"] <= 1e-12:
+                        item["action"] = "HOLD"
+                gross = sum(float(item["target_weight"]) for item in allocations)
+            raw = {
+                "allocations": allocations,
+                "gross_target": gross,
+                "confidence": (
+                    sum(float(item.get("confidence", 0.0)) for item in allocations)
+                    / max(1, len(allocations))
+                ),
+                "rationale": (
+                    "offline cross-asset supervisor preserved or reduced every target"
+                ),
+                "dissent": tuple(
+                    warning
+                    for review in reviews
+                    for warning in review.get("warnings", [])
+                ),
+            }
         else:
             raise ValueError(f"unsupported mock LLM task: {task}")
         return response_model.model_validate(raw)
@@ -316,6 +507,7 @@ class OpenAICompatibleClient:
     provider_name: str = "openai-compatible"
     extra_body: dict[str, Any] = field(default_factory=dict)
     _client: Any = field(default=None, init=False, repr=False)
+    _last_metadata: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not self.api_key:
@@ -327,6 +519,10 @@ class OpenAICompatibleClient:
     def identity(self) -> str:
         endpoint = self.base_url or "openai-default"
         return f"{self.provider_name}:{endpoint}:{self.model}"
+
+    @property
+    def last_metadata(self) -> dict[str, Any]:
+        return dict(self._last_metadata)
 
     def _get_client(self) -> Any:
         if self._client is None:
@@ -389,7 +585,17 @@ class OpenAICompatibleClient:
         if self.extra_body:
             request["extra_body"] = dict(self.extra_body)
         response = self._get_client().chat.completions.create(**request)
-        content = response.choices[0].message.content
+        choice = response.choices[0]
+        content = choice.message.content
+        usage = getattr(response, "usage", None)
+        self._last_metadata = {
+            "response_id": getattr(response, "id", None),
+            "response_model": getattr(response, "model", None),
+            "finish_reason": getattr(choice, "finish_reason", None),
+            "prompt_tokens": getattr(usage, "prompt_tokens", None),
+            "completion_tokens": getattr(usage, "completion_tokens", None),
+            "total_tokens": getattr(usage, "total_tokens", None),
+        }
         if not content:
             raise ValueError("LLM returned empty structured output")
         return response_model.model_validate_json(self._strip_fence(content))
@@ -400,10 +606,19 @@ class CachedLLMClient:
     delegate: StructuredLLMClient
     cache_dir: Path
     log_path: Path
+    _last_call_metadata: dict[str, Any] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
 
     @property
     def identity(self) -> str:
         return self.delegate.identity
+
+    @property
+    def last_call_metadata(self) -> dict[str, Any]:
+        return dict(self._last_call_metadata)
 
     def _cache_key(
         self,
@@ -454,14 +669,13 @@ class CachedLLMClient:
             result = response_model.model_validate_json(
                 cache_path.read_text(encoding="utf-8")
             )
-            self._log(
-                {
-                    **base_record,
-                    "cache_hit": True,
-                    "duration_ms": round((time.perf_counter() - started) * 1000, 3),
-                    "status": "ok",
-                }
-            )
+            self._last_call_metadata = {
+                "cache_hit": True,
+                "runtime_state": "CACHE_HIT",
+                "duration_ms": round((time.perf_counter() - started) * 1000, 3),
+                "usage": {},
+            }
+            self._log({**base_record, **self._last_call_metadata, "status": "ok"})
             return result
         try:
             result = self.delegate.complete(
@@ -471,11 +685,16 @@ class CachedLLMClient:
                 response_model=response_model,
             )
         except Exception as exc:
+            self._last_call_metadata = {
+                "cache_hit": False,
+                "runtime_state": "FAILED",
+                "duration_ms": round((time.perf_counter() - started) * 1000, 3),
+                "usage": {},
+            }
             self._log(
                 {
                     **base_record,
-                    "cache_hit": False,
-                    "duration_ms": round((time.perf_counter() - started) * 1000, 3),
+                    **self._last_call_metadata,
                     "status": "error",
                     "error": f"{type(exc).__name__}: {exc}",
                 }
@@ -485,32 +704,51 @@ class CachedLLMClient:
         temporary = cache_path.with_suffix(".tmp")
         temporary.write_text(result.model_dump_json(indent=2), encoding="utf-8")
         temporary.replace(cache_path)
-        self._log(
-            {
-                **base_record,
-                "cache_hit": False,
-                "duration_ms": round((time.perf_counter() - started) * 1000, 3),
-                "status": "ok",
-            }
-        )
+        self._last_call_metadata = {
+            "cache_hit": False,
+            "runtime_state": (
+                "DRY_RUN"
+                if isinstance(self.delegate, DryRunLLMClient)
+                else "LIVE_OK"
+            ),
+            "duration_ms": round((time.perf_counter() - started) * 1000, 3),
+            "usage": (
+                self.delegate.last_metadata
+                if isinstance(self.delegate, OpenAICompatibleClient)
+                else {}
+            ),
+        }
+        self._log({**base_record, **self._last_call_metadata, "status": "ok"})
         return result
 
 
-def build_llm_client(settings: Any, project_root: str | Path = ".") -> CachedLLMClient:
+def build_llm_client(
+    settings: Any,
+    project_root: str | Path = ".",
+    *,
+    model: str | None = None,
+    cache_namespace: str | None = None,
+) -> CachedLLMClient:
     root = Path(project_root)
     mode = settings.llm_execution_mode
     provider = settings.llm_provider
+    explicit_model = model is not None
+    selected_model = model or settings.llm_model
     if mode == "mock":
-        delegate: StructuredLLMClient = MockLLM(model="mock-research-v1")
+        delegate: StructuredLLMClient = MockLLM(model=selected_model or "mock-research-v1")
     elif mode == "dry_run":
-        delegate = DryRunLLMClient(provider=provider, model=settings.llm_model)
+        delegate = DryRunLLMClient(provider=provider, model=selected_model)
     elif mode == "live":
         api_key = os.environ.get(settings.llm_api_key_env, "")
         base_url = os.environ.get(settings.llm_base_url_env) or None
         if provider == "zhipu":
-            model = os.environ.get("ZHIPU_MODEL", settings.llm_model)
+            resolved_model = (
+                selected_model
+                if explicit_model
+                else os.environ.get("ZHIPU_MODEL", selected_model)
+            )
             delegate = OpenAICompatibleClient(
-                model=model,
+                model=resolved_model,
                 api_key=api_key,
                 base_url=base_url or "https://open.bigmodel.cn/api/paas/v4",
                 temperature=settings.llm_temperature,
@@ -522,19 +760,21 @@ def build_llm_client(settings: Any, project_root: str | Path = ".") -> CachedLLM
             )
         elif provider == "openai_compatible":
             delegate = OpenAICompatibleClient(
-                model=settings.llm_model,
+                model=selected_model,
                 api_key=api_key,
                 base_url=base_url,
                 temperature=settings.llm_temperature,
                 timeout_seconds=settings.llm_timeout_seconds,
             )
         elif provider == "mock":
-            delegate = MockLLM(model=settings.llm_model)
+            delegate = MockLLM(model=selected_model)
         else:
             raise ValueError(f"unsupported live LLM provider: {provider}")
     else:
         raise ValueError(f"unsupported LLM execution mode: {mode}")
     cache_dir = Path(settings.llm_cache_dir)
+    if cache_namespace:
+        cache_dir = cache_dir / cache_namespace
     log_path = Path(settings.llm_log_path)
     if not cache_dir.is_absolute():
         cache_dir = root / cache_dir
@@ -552,6 +792,7 @@ __all__ = [
     "NewsAnalysis",
     "OpenAICompatibleClient",
     "ResearchDecision",
+    "RiskReview",
     "StructuredLLMClient",
     "StructuredReasoner",
     "TradePlan",

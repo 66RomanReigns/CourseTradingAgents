@@ -51,6 +51,7 @@ def render_paper_dashboard(summary: Mapping[str, Any]) -> str:
     orders = summary.get("open_orders", [])
     fills = summary.get("recent_fills", [])
     history = summary.get("equity_history", [])
+    corporate_actions = summary.get("recent_corporate_actions", [])
     positions = account.get("positions", {})
     latest = history[0] if history else None
     equity = float(latest["equity"]) if latest else float(account["cash"])
@@ -82,6 +83,17 @@ def render_paper_dashboard(summary: Mapping[str, Any]) -> str:
             row["timestamp"],
         )
         for row in fills
+    ]
+    action_rows = [
+        (
+            row["action_id"],
+            row["symbol"],
+            row["action_type"],
+            row["effective_at"],
+            f"{row['quantity_before']} → {row['quantity_after']}",
+            _money(float(row["cash_delta"])),
+        )
+        for row in corporate_actions
     ]
 
     return f"""<!doctype html>
@@ -123,4 +135,5 @@ svg {{ width: 100%; height: auto; color: #60a5fa; }}
 <section><h2>Positions</h2>{_table(('Symbol', 'Quantity'), position_rows)}</section>
 <section><h2>Open approval queue</h2>{_table(('Order', 'Symbol', 'Side', 'Target', 'Status', 'Scheduled open'), order_rows)}</section>
 <section><h2>Recent fills</h2>{_table(('Fill', 'Symbol', 'Quantity', 'Price', 'Fee', 'Timestamp'), fill_rows)}</section>
+<section><h2>Corporate actions</h2>{_table(('Action', 'Symbol', 'Type', 'Effective open', 'Quantity', 'Cash delta'), action_rows)}</section>
 </main></body></html>"""

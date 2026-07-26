@@ -1,0 +1,1 @@
+{"action_id": "spy-synthetic-dividend-20240315", "action_type": "CASH_DIVIDEND", "effective_date": "2024-03-15", "cash_amount_per_share": 0.75, "symbol": "SPY", "effective_at": "2024-03-15T09:30:00", "available_at": "2024-03-14T16:00:00", "currency": "USD", "source": "synthetic_multi_asset_fixture"}

@@ -13,8 +13,12 @@ from tradinglab_agents.agents.llm import (
     MockLLM,
     OpenAICompatibleClient,
 )
-from tradinglab_agents.agents.research import MultiAgentResearchPipeline
-from tradinglab_agents.agents.schemas import TradePlan
+from tradinglab_agents.agents.research import (
+    MultiAgentResearchPipeline,
+    PortfolioManagerAgent,
+    research_graph_spec,
+)
+from tradinglab_agents.agents.schemas import RiskReview, TradePlan
 from tradinglab_agents.broker.paper import PaperBroker
 from tradinglab_agents.config import BacktestSettings, load_settings
 from tradinglab_agents.models import (
@@ -122,6 +126,25 @@ class RecordingReasoner:
         return self._result("fundamental", items)
 
 
+class PayloadRecordingClient:
+    def __init__(self):
+        self.delegate = MockLLM()
+        self.calls = []
+
+    @property
+    def identity(self):
+        return "recording:mock"
+
+    def complete(self, *, task, system_prompt, payload, response_model):
+        self.calls.append((task, payload))
+        return self.delegate.complete(
+            task=task,
+            system_prompt=system_prompt,
+            payload=payload,
+            response_model=response_model,
+        )
+
+
 class StructuredAgentPipelineTest(unittest.TestCase):
     @staticmethod
     def _pack():
@@ -166,17 +189,104 @@ class StructuredAgentPipelineTest(unittest.TestCase):
 
             self.assertEqual(first, second)
             self.assertTrue(first.trader.requires_human_approval)
+            self.assertEqual(len(first.risk_reviews), 3)
+            self.assertEqual(len(first.debate_rounds), 1)
+            self.assertTrue(first.preliminary_trader.requires_human_approval)
             self.assertLessEqual(first.trader.target_weight, 0.20)
             self.assertTrue(set(first.trader.evidence_ids).issubset(pack.ids))
-            self.assertEqual(len(list((root / "cache").glob("*.json"))), 7)
+            self.assertEqual(len(list((root / "cache").glob("*.json"))), 11)
 
             records = [
                 json.loads(line)
                 for line in (root / "calls.jsonl").read_text(encoding="utf-8").splitlines()
             ]
-            self.assertEqual(len(records), 14)
-            self.assertEqual(sum(bool(row["cache_hit"]) for row in records), 7)
+            self.assertEqual(len(records), 22)
+            self.assertEqual(sum(bool(row["cache_hit"]) for row in records), 11)
             self.assertTrue(all("api_key" not in json.dumps(row) for row in records))
+
+    def test_risk_committee_can_veto_a_preliminary_buy(self):
+        pack = self._pack()
+        preliminary = TradePlan(
+            action="BUY",
+            confidence=0.55,
+            target_weight=0.15,
+            order_type="MARKET_NEXT_OPEN",
+            rationale="preliminary buy",
+            evidence_ids=("news.1",),
+            requires_human_approval=True,
+        )
+        reviews = (
+            RiskReview(
+                persona="aggressive",
+                verdict="APPROVE",
+                confidence=0.7,
+                max_target_weight=0.15,
+                rationale="approve",
+                evidence_ids=("news.1",),
+            ),
+            RiskReview(
+                persona="balanced",
+                verdict="REDUCE",
+                confidence=0.7,
+                max_target_weight=0.10,
+                rationale="reduce",
+                evidence_ids=("news.1",),
+            ),
+            RiskReview(
+                persona="conservative",
+                verdict="VETO",
+                confidence=0.8,
+                max_target_weight=0.0,
+                rationale="veto",
+                evidence_ids=("news.1",),
+            ),
+        )
+        final = PortfolioManagerAgent(MockLLM()).finalize(
+            pack,
+            preliminary,
+            reviews,
+        )
+        self.assertEqual(final.action, "HOLD")
+        self.assertEqual(final.target_weight, 0.0)
+        self.assertEqual(final.order_type, "NO_ORDER")
+
+    def test_matured_memory_is_supplied_to_decision_roles(self):
+        client = PayloadRecordingClient()
+        memory = {
+            "memory_id": "memory-1",
+            "action": "BUY",
+            "alpha_return": -0.04,
+            "failure_type": "UNDERPERFORMED_BENCHMARK",
+        }
+        MultiAgentResearchPipeline(client).run(
+            self._pack(),
+            memory_context=[memory],
+        )
+        decision_tasks = {
+            "bull_case",
+            "bear_case",
+            "research_manager",
+            "risk_review",
+            "portfolio_manager",
+        }
+        supplied = [
+            payload["matured_decision_memories"]
+            for task, payload in client.calls
+            if task in decision_tasks
+        ]
+        self.assertTrue(supplied)
+        self.assertTrue(all(rows == [memory] for rows in supplied))
+
+    def test_configurable_graph_has_tiered_dependencies(self):
+        graph = research_graph_spec(debate_rounds=2)
+        self.assertEqual(len(graph), 13)
+        by_id = {item["id"]: item for item in graph}
+        self.assertEqual(by_id["news_analyst"]["tier"], "quick")
+        self.assertEqual(by_id["debate_round_2.bull"]["tier"], "deep")
+        self.assertIn(
+            "risk_review.conservative",
+            by_id["portfolio_manager"]["depends_on"],
+        )
 
     def test_invalid_structured_output_is_rejected(self):
         with self.assertRaises(ValidationError):
