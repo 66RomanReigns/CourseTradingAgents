@@ -72,6 +72,14 @@ class PaperTradingStore:
 
     def _initialize(self) -> None:
         with self._connection() as connection:
+            version_cursor = connection.execute("PRAGMA user_version")
+            version = int(version_cursor.fetchone()[0])
+            version_cursor.close()
+            if version > self.CURRENT_SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"paper database schema {version} is newer than supported "
+                    f"{self.CURRENT_SCHEMA_VERSION}"
+                )
             connection.execute("PRAGMA journal_mode = WAL")
             connection.executescript(
                 """
@@ -199,12 +207,6 @@ class PaperTradingStore:
                     ON paper_equity_snapshots(account_id, timestamp DESC);
                 """
             )
-            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version > self.CURRENT_SCHEMA_VERSION:
-                raise RuntimeError(
-                    f"paper database schema {version} is newer than supported "
-                    f"{self.CURRENT_SCHEMA_VERSION}"
-                )
             if version == 0:
                 connection.execute("PRAGMA user_version = 1")
                 version = 1

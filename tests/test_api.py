@@ -66,7 +66,7 @@ class ApiTest(unittest.TestCase):
     def test_workflow_api_is_dry_run_only(self):
         plan = workflow_plan()
         self.assertFalse(plan["external_requests_enabled"])
-        self.assertEqual(plan["remote_llm"]["provider"], "zhipu")
+        self.assertEqual(plan["remote_llm"]["provider"], "openai_compatible")
         market = plan["market_runtime"]
         self.assertEqual(market["calendar"], "XNYS")
         self.assertTrue(market["strict_sessions"])
@@ -79,7 +79,12 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(provider_runtime["thread_suffix"], "DATA_PROVIDER")
         self.assertTrue(provider_runtime["fallback_only_reduces_risk"])
         self.assertFalse(provider_runtime["blocked_data_persisted"])
-        self.assertGreaterEqual(len(provider_runtime["capabilities"]), 9)
+        capability_names = {
+            item["provider"] for item in provider_runtime["capabilities"]
+        }
+        self.assertNotIn("twelve_data", capability_names)
+        self.assertNotIn("fred", capability_names)
+        self.assertGreaterEqual(len(capability_names), 7)
         structured = next(
             step for step in plan["steps"] if step["name"] == "structured_research"
         )

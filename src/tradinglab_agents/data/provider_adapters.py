@@ -175,15 +175,18 @@ class ProviderAdapterFactory:
         capability: ProviderCapability,
     ) -> ProviderCandidate:
         metadata = self._market_metadata(request)
+        alpha_outputsize = str(metadata.get("alpha_vantage_outputsize", "")).lower()
+        if alpha_outputsize not in {"compact", "full"}:
+            alpha_outputsize = (
+                "full"
+                if int(metadata.get("outputsize", 5000)) > 100
+                else "compact"
+            )
         bars = AlphaVantageNewsClient(
             http=self._http(capability)
         ).fetch_daily_bars(
             request.resource,
-            outputsize=(
-                "full"
-                if int(metadata.get("outputsize", 5000)) > 100
-                else "compact"
-            ),
+            outputsize=alpha_outputsize,
             force_refresh=bool(metadata.get("force_refresh", False)),
             calendar_name=self.calendar_name,
             start_date=self._date(metadata.get("start_date")),

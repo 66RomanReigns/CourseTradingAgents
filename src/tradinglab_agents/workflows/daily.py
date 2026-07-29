@@ -221,6 +221,11 @@ class DailyWorkflow:
             "fundamentals": "SEC_USER_AGENT",
             "llm": self.settings.llm_api_key_env,
         }
+        disabled = set(self.settings.workflow_disabled_providers)
+        if "twelve_data" in disabled:
+            credential_names.pop("market_primary", None)
+        if "fred" in disabled:
+            credential_names.pop("macro", None)
         steps = [
             {
                 "name": "preflight",
@@ -245,9 +250,13 @@ class DailyWorkflow:
                 "enabled": self.settings.workflow_refresh_market,
                 "provider": "provider_graph",
                 "provider_chain": [
-                    "twelve_data",
-                    "alpha_vantage_market",
-                    "local_market_cache",
+                    provider
+                    for provider in (
+                        "twelve_data",
+                        "alpha_vantage_market",
+                        "local_market_cache",
+                    )
+                    if provider not in self.settings.workflow_disabled_providers
                 ],
                 "note": (
                     "maximum external attempts; local cache consumes zero quota"
@@ -265,7 +274,11 @@ class DailyWorkflow:
                 "external_calls": len(self.settings.workflow_macro_series),
                 "enabled": self.settings.workflow_refresh_macro,
                 "provider": "provider_graph",
-                "provider_chain": ["fred", "local_macro_cache"],
+                "provider_chain": [
+                    provider
+                    for provider in ("fred", "local_macro_cache")
+                    if provider not in self.settings.workflow_disabled_providers
+                ],
             },
             {
                 "name": "refresh_fundamentals",
@@ -466,7 +479,9 @@ class DailyWorkflow:
                 "fallback_only_reduces_risk": True,
                 "blocked_data_persisted": False,
                 "credentials_logged": False,
-                "capabilities": default_provider_registry().as_dict()["providers"],
+                "capabilities": default_provider_registry()
+                .excluding(self.settings.workflow_disabled_providers)
+                .as_dict()["providers"],
             },
             "market_runtime": {
                 "calendar": self.settings.market_calendar_name,
@@ -687,17 +702,24 @@ class DailyWorkflow:
     def _provider_requests(self, data_dir: Path) -> tuple[ProviderRequest, ...]:
         requests: list[ProviderRequest] = []
         today = datetime.now(timezone.utc).date()
+        alpha_market_only = "twelve_data" in self.settings.workflow_disabled_providers
         if self.settings.workflow_refresh_market:
             for symbol in self.settings.workflow_symbols:
                 path = data_dir / f"{symbol}.csv"
                 start_date = None
                 outputsize = 5000
                 refresh_mode = "initial_full"
+                alpha_vantage_outputsize = None
+                if alpha_market_only:
+                    outputsize = 100
+                    refresh_mode = "initial_compact"
+                    alpha_vantage_outputsize = "compact"
                 if path.is_file():
                     existing = LocalCsvProvider(path, symbol)
                     start_date = existing.bars[-1].timestamp.date() - timedelta(days=7)
                     outputsize = 100
                     refresh_mode = "incremental_overlap"
+                    alpha_vantage_outputsize = "compact"
                 requests.append(
                     ProviderRequest(
                         request_id=f"market.{symbol}",
@@ -712,6 +734,7 @@ class DailyWorkflow:
                             ),
                             "end_date": today.isoformat(),
                             "outputsize": outputsize,
+                            "alpha_vantage_outputsize": alpha_vantage_outputsize,
                             "expected_min_records": 1,
                             "refresh_mode": refresh_mode,
                             "force_refresh": True,
@@ -790,7 +813,9 @@ class DailyWorkflow:
             calendar_name=self.settings.market_calendar_name,
         )
         router = ProviderFallbackRouter(
-            registry=default_provider_registry(),
+            registry=default_provider_registry().excluding(
+                self.settings.workflow_disabled_providers
+            ),
             health_store=ProviderHealthStore(
                 self._resolve(self.settings.workflow_provider_health_database)
             ),

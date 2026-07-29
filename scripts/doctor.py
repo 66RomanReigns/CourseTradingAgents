@@ -73,6 +73,38 @@ def _check_import(name: str, distribution: str | None = None) -> dict:
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
+def _windows_secret_acl_status(path: Path) -> tuple[bool, str]:
+    try:
+        path.resolve().relative_to(Path.home().resolve())
+    except ValueError:
+        return False, "Windows secret file must be under the current user directory"
+    try:
+        whoami = subprocess.run(
+            ["whoami"], capture_output=True, text=True, check=False
+        )
+        acl = subprocess.run(
+            ["icacls", str(path)], capture_output=True, text=True, check=False
+        )
+    except OSError as exc:
+        return False, f"Windows ACL inspection unavailable: {type(exc).__name__}"
+    if acl.returncode != 0:
+        return False, "Windows ACL inspection failed"
+    identity = whoami.stdout.strip().lower()
+    lines = acl.stdout.splitlines()
+    entries = "\n".join(lines[1:]).lower()
+    broad_principals = (
+        "everyone",
+        "authenticated users",
+        "\\users:",
+        "builtin\\users",
+    )
+    if any(principal in entries for principal in broad_principals):
+        return False, "Windows secret file ACL grants access to a broad principal"
+    if not identity or identity not in entries:
+        return False, "Windows secret file ACL does not grant the current user access"
+    return True, "Windows ACL is explicit and limited to the current user"
+
+
 def _secret_file_status() -> dict:
     path = Path(
         os.environ.get(
@@ -81,11 +113,10 @@ def _secret_file_status() -> dict:
         )
     )
     required = {
-        "TWELVE_DATA_API_KEY",
         "ALPHA_VANTAGE_API_KEY",
-        "FRED_API_KEY",
+        "SEC_USER_AGENT",
         "GOOGLE_API_KEY",
-        "ZHIPU_API_KEY",
+        "DEEPSEEK_API_KEY",
         "TRADINGLAB_API_TOKEN",
     }
     if not path.is_file():
@@ -95,7 +126,11 @@ def _secret_file_status() -> dict:
             "path": str(path),
             "detail": "external secret file is not configured",
         }
-    permissions = f"{path.stat().st_mode & 0o777:03o}"
+    if os.name == "nt":
+        permissions_ok, permissions = _windows_secret_acl_status(path)
+    else:
+        permissions = f"{path.stat().st_mode & 0o777:03o}"
+        permissions_ok = permissions == "600"
     configured: set[str] = set()
     for raw in path.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
@@ -106,7 +141,7 @@ def _secret_file_status() -> dict:
             configured.add(name.strip())
     missing = sorted(required.difference(configured))
     return {
-        "ok": permissions == "600" and not missing,
+        "ok": permissions_ok and not missing,
         "severity": "warning",
         "path": str(path),
         "permissions": permissions,

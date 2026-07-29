@@ -62,10 +62,10 @@ class FakeCompletions:
         )
 
 
-class GlmProviderContractTest(unittest.TestCase):
-    def test_default_client_is_no_network_glm_dry_run(self):
+class DeepSeekProviderContractTest(unittest.TestCase):
+    def test_default_client_is_no_network_deepseek_dry_run(self):
         client = build_llm_client(SETTINGS, ROOT)
-        self.assertEqual(client.identity, "dry-run:zhipu:glm-4.7-flash")
+        self.assertEqual(client.identity, "dry-run:openai_compatible:deepseek-v4-flash")
         self.assertIsInstance(client.delegate, DryRunLLMClient)
 
     def test_explicit_quick_and_deep_models_keep_distinct_identities(self):
@@ -82,14 +82,34 @@ class GlmProviderContractTest(unittest.TestCase):
             model="deep-test-model",
             cache_namespace="deep-test",
         )
-        self.assertEqual(quick.identity, "dry-run:zhipu:quick-test-model")
-        self.assertEqual(deep.identity, "dry-run:zhipu:deep-test-model")
+        self.assertEqual(quick.identity, "dry-run:openai_compatible:quick-test-model")
+        self.assertEqual(deep.identity, "dry-run:openai_compatible:deep-test-model")
 
     def test_live_glm_requires_key_before_network_use(self):
         settings = replace(SETTINGS, llm_execution_mode="live")
         with patch.dict("os.environ", {}, clear=True):
             with self.assertRaisesRegex(ValueError, "API key"):
                 build_llm_client(settings, ROOT)
+
+    def test_live_deepseek_uses_official_endpoint_and_request_shape(self):
+        settings = replace(SETTINGS, llm_execution_mode="live")
+        with patch.dict(
+            "os.environ",
+            {
+                "DEEPSEEK_API_KEY": "unit-test-placeholder",
+                "DEEPSEEK_BASE_URL": "https://api.deepseek.com",
+            },
+            clear=True,
+        ):
+            client = build_llm_client(settings, ROOT)
+        self.assertIsInstance(client.delegate, OpenAICompatibleClient)
+        self.assertEqual(client.delegate.provider_name, "deepseek")
+        self.assertEqual(client.delegate.model, "deepseek-v4-flash")
+        self.assertEqual(client.delegate.base_url, "https://api.deepseek.com")
+        self.assertEqual(
+            client.delegate.extra_body,
+            {"thinking": {"type": "disabled"}},
+        )
 
     def test_zhipu_request_contract_includes_structured_json_and_thinking(self):
         completions = FakeCompletions()
@@ -151,7 +171,7 @@ class WorkflowSafetyTest(unittest.TestCase):
                 for row in result["research"]["result"]["candidates"].values()
                 for identity in row["clients"].values()
             }
-            self.assertEqual(identities, {"dry-run:zhipu:glm-4.7-flash"})
+            self.assertEqual(identities, {"dry-run:openai_compatible:deepseek-v4-flash"})
             candidate = next(iter(result["research"]["result"]["candidates"].values()))
             self.assertEqual(len(candidate["result"]["risk_reviews"]), 3)
             self.assertEqual(len(candidate["result"]["debate_rounds"]), 2)

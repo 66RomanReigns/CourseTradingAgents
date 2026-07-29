@@ -83,6 +83,7 @@ _CONFIG_SCHEMA: dict[str, Any] = {
         "connectivity_probe_url": None,
         "provider_usage_database": None,
         "provider_graph_enabled": None,
+        "disabled_providers": None,
         "provider_health_database": None,
         "provider_checkpoint_database": None,
         "provider_min_quality_score": None,
@@ -212,6 +213,7 @@ class BacktestSettings:
     )
     workflow_provider_usage_database: str = "artifacts/provider_usage.db"
     workflow_provider_graph_enabled: bool = True
+    workflow_disabled_providers: tuple[str, ...] = ()
     workflow_provider_health_database: str = "artifacts/provider_health.db"
     workflow_provider_checkpoint_database: str = (
         "artifacts/langgraph/data_provider_checkpoints.db"
@@ -625,6 +627,12 @@ class BacktestSettings:
                 workflow.get(
                     "provider_graph_enabled",
                     cls.workflow_provider_graph_enabled,
+                )
+            ),
+            workflow_disabled_providers=tuple(
+                str(provider).strip().lower()
+                for provider in workflow.get(
+                    "disabled_providers", cls.workflow_disabled_providers
                 )
             ),
             workflow_provider_health_database=str(

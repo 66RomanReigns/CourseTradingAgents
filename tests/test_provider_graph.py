@@ -24,6 +24,7 @@ from tradinglab_agents.data.provider_registry import (
     DataKind,
     ProviderCapability,
     ProviderRegistry,
+    default_provider_registry,
 )
 from tradinglab_agents.storage.provider_health import (
     ProviderHealthStatus,
@@ -94,6 +95,18 @@ def _candidate(provider: str, resource: str, close: float) -> ProviderCandidate:
 
 
 class ProviderFallbackRouterTest(unittest.TestCase):
+    def test_default_workflow_can_exclude_unavailable_external_providers(self):
+        registry = default_provider_registry().excluding(("twelve_data", "fred"))
+        providers = {
+            item.provider
+            for kind in DataKind
+            for item in registry.providers_for(kind)
+        }
+        self.assertNotIn("twelve_data", providers)
+        self.assertNotIn("fred", providers)
+        self.assertIn("alpha_vantage_market", providers)
+        self.assertIn("local_macro_cache", providers)
+
     def test_rate_limited_primary_falls_back_and_blocks_expansion(self):
         with tempfile.TemporaryDirectory() as directory:
             registry = ProviderRegistry(
@@ -132,6 +145,45 @@ class ProviderFallbackRouterTest(unittest.TestCase):
             primary_health = health.get("primary", DataKind.MARKET_DAILY)
             self.assertEqual(primary_health.status, ProviderHealthStatus.RATE_LIMITED)
             self.assertFalse(primary_health.is_available)
+
+    def test_local_cache_failure_does_not_enter_global_cooldown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            health = ProviderHealthStore(Path(directory) / "health.db")
+            registry = ProviderRegistry(
+                (_capability("local_cache", 100, authority=0.72, is_cache=True),)
+            )
+            request = ProviderRequest(
+                request_id="market.MSFT",
+                data_kind=DataKind.MARKET_DAILY,
+                resource="MSFT",
+            )
+
+            def missing_cache(_request, _capability):
+                raise FileNotFoundError("missing cache")
+
+            first = ProviderFallbackRouter(
+                registry=registry,
+                health_store=health,
+                run_id="cache-missing",
+                fetchers={"local_cache": missing_cache},
+            )
+            with self.assertRaisesRegex(RuntimeError, "all providers failed"):
+                first.route(request)
+            self.assertTrue(
+                health.get("local_cache", DataKind.MARKET_DAILY).is_available
+            )
+
+            def restored_cache(request, _capability):
+                return _candidate("local_cache", request.resource, 100.0)
+
+            second = ProviderFallbackRouter(
+                registry=registry,
+                health_store=health,
+                run_id="cache-restored",
+                fetchers={"local_cache": restored_cache},
+            )
+            result = second.route(request)
+            self.assertEqual(result.selected.provider, "local_cache")
 
     def test_shared_daily_quota_blocks_before_fetch_and_uses_cache(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -468,6 +520,26 @@ class DataProviderGraphTest(unittest.TestCase):
 
 
 class ProviderGraphWorkflowIntegrationTest(unittest.TestCase):
+    def test_disabled_twelve_data_keeps_alpha_market_on_free_compact_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = replace(
+                SETTINGS,
+                workflow_symbols=("MSFT", "NVDA"),
+                workflow_live_data_dir=directory,
+                workflow_disabled_providers=("twelve_data", "fred"),
+                workflow_refresh_market=True,
+                workflow_refresh_news=False,
+                workflow_refresh_macro=False,
+                workflow_refresh_fundamentals=False,
+            )
+            workflow = DailyWorkflow(settings, ROOT)
+            requests = workflow._provider_requests(Path(directory))
+
+        market = next(item for item in requests if item.request_id == "market.MSFT")
+        self.assertEqual(market.metadata["outputsize"], 100)
+        self.assertEqual(market.metadata["alpha_vantage_outputsize"], "compact")
+        self.assertEqual(market.metadata["refresh_mode"], "initial_compact")
+
     def test_degraded_provider_graph_flows_through_workflow_core_without_network(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

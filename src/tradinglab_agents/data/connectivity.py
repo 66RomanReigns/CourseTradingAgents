@@ -138,6 +138,32 @@ def probe_external_access(
             tls_url=tls_url,
             detail=f"TLS certificate verification failed: {exc}",
         )
+    except HTTPError as exc:
+        if exc.code in {407, 511}:
+            return ConnectivityResult(
+                state=NetworkState.CAPTIVE_PORTAL,
+                ok=False,
+                probe_url=probe_url,
+                final_url=final_url,
+                http_status=status,
+                tls_url=tls_url,
+                detail=(
+                    "HTTPS path requires proxy or network authentication; "
+                    f"TLS probe returned HTTP {exc.code}"
+                ),
+            )
+        return ConnectivityResult(
+            state=NetworkState.ONLINE,
+            ok=True,
+            probe_url=probe_url,
+            final_url=final_url,
+            http_status=status,
+            tls_url=tls_url,
+            detail=(
+                "external HTTPS access is available with normal certificate "
+                f"verification; TLS endpoint returned HTTP {exc.code}"
+            ),
+        )
     except URLError as exc:
         reason = getattr(exc, "reason", None)
         if isinstance(reason, ssl.SSLCertVerificationError):

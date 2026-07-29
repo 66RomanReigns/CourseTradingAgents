@@ -278,7 +278,7 @@ class ProviderFallbackRouter:
         capability: ProviderCapability,
     ) -> tuple[ProviderCandidate | None, ProviderAttempt]:
         health = self.health_store.get(capability.provider, request.data_kind)
-        if not health.is_available:
+        if not capability.is_cache and not health.is_available:
             return None, ProviderAttempt(
                 provider=capability.provider,
                 status="SKIPPED",
@@ -403,17 +403,18 @@ class ProviderFallbackRouter:
             duration_ms = round((time.perf_counter() - started) * 1000.0, 3)
             state = classify_provider_exception(exc)
             safe_error = f"{type(exc).__name__}: {exc}"[:1000]
-            self.health_store.record_failure(
-                run_id=self.run_id,
-                provider=capability.provider,
-                data_kind=request.data_kind,
-                provider_state=state,
-                reason=safe_error,
-                detail={
-                    "request_id": request.request_id,
-                    "resource": request.resource,
-                },
-            )
+            if not capability.is_cache:
+                self.health_store.record_failure(
+                    run_id=self.run_id,
+                    provider=capability.provider,
+                    data_kind=request.data_kind,
+                    provider_state=state,
+                    reason=safe_error,
+                    detail={
+                        "request_id": request.request_id,
+                        "resource": request.resource,
+                    },
+                )
             if self.tracker is not None:
                 self.tracker.record_state(
                     provider=capability.provider,

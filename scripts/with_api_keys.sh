@@ -18,7 +18,7 @@ set -a
 source "$KEYS_FILE"
 set +a
 
-required=(TWELVE_DATA_API_KEY ALPHA_VANTAGE_API_KEY FRED_API_KEY SEC_USER_AGENT GOOGLE_API_KEY ZHIPU_API_KEY TRADINGLAB_API_TOKEN)
+required=(ALPHA_VANTAGE_API_KEY SEC_USER_AGENT GOOGLE_API_KEY DEEPSEEK_API_KEY TRADINGLAB_API_TOKEN)
 for name in "${required[@]}"; do
   if [[ -z "${!name:-}" ]]; then
     echo "error: missing $name in $KEYS_FILE" >&2
@@ -33,4 +33,6 @@ if [[ $# -eq 0 ]]; then
 fi
 export ZHIPU_BASE_URL="${ZHIPU_BASE_URL:-https://open.bigmodel.cn/api/paas/v4}"
 export ZHIPU_MODEL="${ZHIPU_MODEL:-glm-4.7-flash}"
+export DEEPSEEK_BASE_URL="${DEEPSEEK_BASE_URL:-https://api.deepseek.com}"
+export DEEPSEEK_MODEL="${DEEPSEEK_MODEL:-deepseek-v4-flash}"
 exec "$@"

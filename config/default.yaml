@@ -3,14 +3,14 @@ project:
 
 llm:
   execution_mode: dry_run
-  provider: zhipu
-  model: glm-4.7-flash
-  quick_model: glm-4.7-flash
-  deep_model: glm-4.7-flash
+  provider: openai_compatible
+  model: deepseek-v4-flash
+  quick_model: deepseek-v4-flash
+  deep_model: deepseek-v4-flash
   temperature: 0.0
   thinking_mode: disabled
-  api_key_env: ZHIPU_API_KEY
-  base_url_env: ZHIPU_BASE_URL
+  api_key_env: DEEPSEEK_API_KEY
+  base_url_env: DEEPSEEK_BASE_URL
   timeout_seconds: 60
   cache_dir: artifacts/llm_cache
   log_path: artifacts/llm_calls.jsonl
@@ -75,6 +75,7 @@ workflow:
   connectivity_probe_url: http://connectivitycheck.gstatic.com/generate_204
   provider_usage_database: artifacts/provider_usage.db
   provider_graph_enabled: true
+  disabled_providers: [twelve_data, fred]
   provider_health_database: artifacts/provider_health.db
   provider_checkpoint_database: artifacts/langgraph/data_provider_checkpoints.db
   provider_min_quality_score: 0.75
@@ -86,7 +87,7 @@ workflow:
   stale_data_max_hours: 48
   refresh_market: true
   refresh_news: true
-  refresh_macro: true
+  refresh_macro: false
   refresh_fundamentals: true
   run_research: true
   run_paper: true

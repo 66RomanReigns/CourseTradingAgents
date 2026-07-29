@@ -5,7 +5,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 
 from tradinglab_agents.config import load_settings
 from tradinglab_agents.data.connectivity import (
@@ -87,6 +87,52 @@ class ConnectivityPreflightTest(unittest.TestCase):
             result = probe_external_access(timeout_seconds=1)
         self.assertEqual(result.state, NetworkState.ONLINE)
         self.assertTrue(result.ok)
+
+    def test_tls_http_404_is_online(self):
+        tls_error = HTTPError(
+            "https://api.twelvedata.com/",
+            404,
+            "not found",
+            {},
+            _ProbeResponse(status=404, url="https://api.twelvedata.com/"),
+        )
+        with patch(
+            "tradinglab_agents.data.connectivity.urlopen",
+            side_effect=[
+                _ProbeResponse(
+                    status=204,
+                    url="http://connectivitycheck.gstatic.com/generate_204",
+                ),
+                tls_error,
+            ],
+        ):
+            result = probe_external_access(timeout_seconds=1)
+        self.assertEqual(result.state, NetworkState.ONLINE)
+        self.assertTrue(result.ok)
+
+    def test_tls_proxy_and_network_authentication_are_not_online(self):
+        for status in (407, 511):
+            with self.subTest(status=status):
+                tls_error = HTTPError(
+                    "https://api.twelvedata.com/",
+                    status,
+                    "authentication required",
+                    {},
+                    _ProbeResponse(status=status, url="https://api.twelvedata.com/"),
+                )
+                with patch(
+                    "tradinglab_agents.data.connectivity.urlopen",
+                    side_effect=[
+                        _ProbeResponse(
+                            status=204,
+                            url="http://connectivitycheck.gstatic.com/generate_204",
+                        ),
+                        tls_error,
+                    ],
+                ):
+                    result = probe_external_access(timeout_seconds=1)
+                self.assertEqual(result.state, NetworkState.CAPTIVE_PORTAL)
+                self.assertFalse(result.ok)
 
     def test_tls_interception_is_distinct_from_offline(self):
         verification_error = ssl.SSLCertVerificationError(1, "self signed")

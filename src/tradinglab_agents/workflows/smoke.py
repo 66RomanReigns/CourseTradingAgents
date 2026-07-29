@@ -26,12 +26,11 @@ class ProviderSmokeRunner:
     """Minimal, quota-conscious validation for each configured external service."""
 
     PROVIDERS = (
-        "twelve_data",
         "alpha_vantage",
-        "fred",
         "sec_edgar",
-        "zhipu",
+        "deepseek",
     )
+    LEGACY_PROVIDERS = ("twelve_data", "fred", "zhipu")
 
     def __init__(self, settings: BacktestSettings, project_root: str | Path):
         self.settings = settings
@@ -50,7 +49,7 @@ class ProviderSmokeRunner:
         run_id: str | None = None,
     ) -> dict[str, Any]:
         selected = provider.lower().strip()
-        if selected not in {*self.PROVIDERS, "all"}:
+        if selected not in {*self.PROVIDERS, *self.LEGACY_PROVIDERS, "all"}:
             raise ValueError(
                 "provider must be one of: all, " + ", ".join(self.PROVIDERS)
             )
@@ -171,7 +170,7 @@ class ProviderSmokeRunner:
                         records[-1].available_at.isoformat() if records else None
                     ),
                 }
-            elif item == "zhipu":
+            elif item in {"deepseek", "zhipu"}:
                 live_settings = replace(
                     self.settings,
                     llm_execution_mode="live",

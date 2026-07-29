@@ -50,11 +50,15 @@ class DatabaseMigrationAndMemoryTest(unittest.TestCase):
     def test_legacy_database_migrates_and_future_schema_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             legacy = Path(directory) / "legacy.db"
-            with sqlite3.connect(legacy) as connection:
+            connection = sqlite3.connect(legacy)
+            try:
                 connection.execute("PRAGMA user_version = 1")
+            finally:
+                connection.close()
             store = PaperTradingStore(legacy)
             self.assertEqual(store.schema_version, 3)
-            with sqlite3.connect(legacy) as connection:
+            connection = sqlite3.connect(legacy)
+            try:
                 row = connection.execute(
                     "SELECT name FROM sqlite_master "
                     "WHERE type='table' AND name='paper_decision_memories'"
@@ -63,12 +67,17 @@ class DatabaseMigrationAndMemoryTest(unittest.TestCase):
                     "SELECT name FROM sqlite_master "
                     "WHERE type='table' AND name='paper_corporate_action_events'"
                 ).fetchone()
+            finally:
+                connection.close()
             self.assertIsNotNone(row)
             self.assertIsNotNone(corporate_row)
 
             future = Path(directory) / "future.db"
-            with sqlite3.connect(future) as connection:
+            connection = sqlite3.connect(future)
+            try:
                 connection.execute("PRAGMA user_version = 99")
+            finally:
+                connection.close()
             with self.assertRaisesRegex(RuntimeError, "newer than supported"):
                 PaperTradingStore(future)
 

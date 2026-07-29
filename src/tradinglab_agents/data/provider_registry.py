@@ -117,6 +117,12 @@ class ProviderRegistry:
             )
         )
 
+    def excluding(self, providers: Iterable[str]) -> "ProviderRegistry":
+        disabled = {str(provider).strip().lower() for provider in providers}
+        return ProviderRegistry(
+            item for item in self._items.values() if item.provider not in disabled
+        )
+
     def as_dict(self) -> dict[str, object]:
         return {
             "providers": [

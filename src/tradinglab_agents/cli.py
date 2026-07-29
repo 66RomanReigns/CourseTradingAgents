@@ -1056,7 +1056,10 @@ def main() -> None:
             "alpha_vantage",
             "fred",
             "sec_edgar",
+            "deepseek",
             "zhipu",
+            "twelve_data",
+            "fred",
         ),
         default="all",
     )

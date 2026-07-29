@@ -53,11 +53,11 @@ providers:
     cache_ttl_seconds: 86400
     policy: "Refresh only configured macro series; use one-second spacing and retain point-in-time vintages."
 
-  zhipu:
-    quick_model: glm-4.7-flash
-    deep_model: glm-4.7-flash
-    official_status: "Free model"
-    endpoint: "https://open.bigmodel.cn/api/paas/v4"
+  deepseek:
+    quick_model: deepseek-v4-flash
+    deep_model: deepseek-v4-flash
+    official_status: "OpenAI-compatible API model"
+    endpoint: "https://api.deepseek.com"
     application_budget:
       maximum_requests_per_workflow: 29
       candidate_symbols_per_workflow: 2

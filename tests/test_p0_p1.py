@@ -77,8 +77,13 @@ class StrictConfigurationTest(unittest.TestCase):
     def test_default_config_is_strict_and_loadable(self):
         settings = load_settings(ROOT / "config/default.yaml")
         self.assertEqual(settings.llm_execution_mode, "dry_run")
-        self.assertEqual(settings.llm_provider, "zhipu")
-        self.assertEqual(settings.llm_model, "glm-4.7-flash")
+        self.assertEqual(settings.llm_provider, "openai_compatible")
+        self.assertEqual(settings.llm_model, "deepseek-v4-flash")
+        self.assertEqual(settings.llm_api_key_env, "DEEPSEEK_API_KEY")
+        self.assertEqual(
+            settings.workflow_disabled_providers,
+            ("twelve_data", "fred"),
+        )
         self.assertEqual(settings.max_position_weight, 0.20)
 
     def test_unknown_or_unimplemented_config_is_rejected(self):
@@ -310,6 +315,24 @@ class StructuredAgentPipelineTest(unittest.TestCase):
     def test_settings_reject_unknown_provider(self):
         with self.assertRaises(ValueError):
             replace(BacktestSettings(), llm_provider="unknown")
+
+
+class WindowsKeyLoaderContractTest(unittest.TestCase):
+    def test_powershell_loader_normalizes_optional_outer_quotes(self):
+        source = (ROOT / "scripts" / "with_api_keys.ps1").read_text(encoding="utf-8")
+        self.assertIn(
+            "$value = $line.Substring($separator + 1).Trim()",
+            source,
+        )
+        self.assertIn("$value = $value.Substring(1, $value.Length - 2)", source)
+        self.assertIn("SEC_USER_AGENT", source)
+
+    def test_powershell_loader_forwards_child_switches_without_rebinding(self):
+        source = (ROOT / "scripts" / "with_api_keys.ps1").read_text(encoding="utf-8")
+        self.assertIn("$CommandLine = @($MyInvocation.UnboundArguments)", source)
+        self.assertIn("$command = $CommandLine[0]", source)
+        self.assertIn("for ($index = 1; $index -lt $CommandLine.Count; $index++)", source)
+        self.assertIn("& $command @arguments", source)
 
 
 if __name__ == "__main__":

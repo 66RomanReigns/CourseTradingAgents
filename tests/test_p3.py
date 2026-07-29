@@ -1,4 +1,3 @@
-import fcntl
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,6 +11,8 @@ from tradinglab_agents.paper.models import (
 )
 from tradinglab_agents.paper.scheduler import (
     SchedulerBusyError,
+    _lock_file,
+    _unlock_file,
     account_lock_path,
     run_next_with_lock,
 )
@@ -188,7 +189,7 @@ class PaperTradingLifecycleTest(unittest.TestCase):
         lock_path = Path(self.temp.name) / "paper.lock"
         derived_lock = account_lock_path(lock_path, "demo")
         with derived_lock.open("a+", encoding="utf-8") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _lock_file(handle)
             with self.assertRaises(SchedulerBusyError):
                 run_next_with_lock(
                     self.service,
@@ -196,7 +197,7 @@ class PaperTradingLifecycleTest(unittest.TestCase):
                     data_dir=DATA_DIR,
                     lock_path=lock_path,
                 )
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            _unlock_file(handle)
 
     def test_one_shot_scheduler_advances_exactly_one_session(self):
         self._create()

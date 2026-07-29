@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -611,6 +612,11 @@ class CachedLLMClient:
         init=False,
         repr=False,
     )
+    _log_lock: threading.Lock = field(
+        default_factory=threading.Lock,
+        init=False,
+        repr=False,
+    )
 
     @property
     def identity(self) -> str:
@@ -644,8 +650,11 @@ class CachedLLMClient:
 
     def _log(self, record: dict[str, Any]) -> None:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.log_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        with self._log_lock:
+            with self.log_path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(record, ensure_ascii=False, default=str) + "\n"
+                )
 
     def complete(
         self,
@@ -759,12 +768,19 @@ def build_llm_client(
                 },
             )
         elif provider == "openai_compatible":
+            is_deepseek = settings.llm_api_key_env == "DEEPSEEK_API_KEY"
             delegate = OpenAICompatibleClient(
                 model=selected_model,
                 api_key=api_key,
-                base_url=base_url,
+                base_url=base_url or ("https://api.deepseek.com" if is_deepseek else None),
                 temperature=settings.llm_temperature,
                 timeout_seconds=settings.llm_timeout_seconds,
+                provider_name="deepseek" if is_deepseek else "openai-compatible",
+                extra_body=(
+                    {"thinking": {"type": settings.llm_thinking_mode}}
+                    if is_deepseek
+                    else {}
+                ),
             )
         elif provider == "mock":
             delegate = MockLLM(model=selected_model)

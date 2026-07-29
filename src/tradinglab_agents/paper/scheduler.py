@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import fcntl
+import os
 import re
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -9,9 +9,33 @@ from typing import Any
 
 from tradinglab_agents.paper.service import PaperTradingService
 
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
+
 
 class SchedulerBusyError(RuntimeError):
     pass
+
+
+def _lock_file(handle: Any) -> None:
+    if os.name == "nt":
+        handle.seek(0)
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
+            raise BlockingIOError from exc
+    else:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock_file(handle: Any) -> None:
+    if os.name == "nt":
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def account_lock_path(lock_path: str | Path, account_id: str) -> Path:
@@ -33,21 +57,38 @@ def account_process_lock(
 
     path = account_lock_path(lock_path, account_id)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+", encoding="utf-8") as handle:
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise SchedulerBusyError(
-                f"paper account is already being processed: {account_id} ({path})"
-            ) from exc
-        try:
+    try:
+        handle = path.open("a+", encoding="utf-8")
+    except PermissionError as exc:
+        raise SchedulerBusyError(
+            f"paper account is already being processed: {account_id} ({path})"
+        ) from exc
+    try:
+        if os.name == "nt":
             handle.seek(0)
-            handle.truncate()
-            handle.write(f"account_id={account_id}\n")
+            handle.write("\0")
             handle.flush()
-            yield path
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        _lock_file(handle)
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"account_id={account_id}\n")
+        handle.flush()
+    except (BlockingIOError, PermissionError) as exc:
+        try:
+            handle.close()
+        except PermissionError:
+            pass
+        raise SchedulerBusyError(
+            f"paper account is already being processed: {account_id} ({path})"
+        ) from exc
+    try:
+        yield path
+    finally:
+        _unlock_file(handle)
+        try:
+            handle.close()
+        except PermissionError:
+            pass
 
 
 def run_session_with_lock(
